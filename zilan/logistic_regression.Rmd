@@ -1,0 +1,615 @@
+---
+title: "Multinomial Logistic Regression – Shelter Outcomes"
+author: "Zhelang (Zilan) Li – W01G04"
+output:
+  html_document:
+    code_folding: hide
+    toc: true
+    toc_depth: 3
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(message = FALSE, warning = FALSE, fig.align = "center",
+                      out.width = "85%")
+```
+
+This is my model section for the group report: multinomial logistic regression (LR), the
+interpretable linear baseline in our plan. It reuses the group's shared preprocessing from
+`STAT5003_group_project_RMarkdown_template_v29.Rmd` without changing it, so the CV folds,
+train/test split and predictors are identical to everyone else's. All code is in this file; it
+knits from the `zilan/` folder of the repo.
+
+## 1. Shared preprocessing (from the group template)
+
+To stay in sync with the group, the template's code (all chunks up to and including
+`common-cv-preprocessing`) is extracted with `knitr::purl()` and run here. Its EDA plots
+are suppressed. This gives the same `train_raw`/`test_raw`, `x_train`, `y_train`,
+`x_test`, `y_test`, `cv_folds` and `cv_data` (seed 5003, stratified 80/20 split, 5 folds).
+
+```{r shared-prep}
+repo_dir <- normalizePath("..")
+template_file <- file.path(repo_dir, "STAT5003_group_project_RMarkdown_template_v29.Rmd")
+
+purled <- tempfile(fileext = ".R")
+invisible(knitr::purl(template_file, output = purled, documentation = 1, quiet = TRUE))
+template_code <- readLines(purled)
+stop_line <- grep("^## ----fit-multinomial", template_code)[1] - 1
+stopifnot(!is.na(stop_line))
+
+old_wd <- setwd(repo_dir)
+grDevices::pdf(NULL)                       # swallow the template's EDA plots
+invisible(capture.output(
+  suppressMessages(eval(parse(text = template_code[1:stop_line]), envir = globalenv()))
+))
+grDevices::dev.off()
+setwd(old_wd)
+
+library(dplyr); library(tidyr); library(ggplot2); library(nnet); library(glmnet)
+library(splines); library(knitr)
+set.seed(5003)
+dir.create("results", showWarnings = FALSE)
+
+classes <- levels(y_train)
+stopifnot(!anyNA(x_train), !anyNA(x_test))
+kable(tibble(Set = c("Latest-intake animals", "Training (80%)", "Test (20%)"),
+             n = c(nrow(data_latest), nrow(x_train), nrow(x_test)),
+             Animals_shared_with_train = c(NA, NA,
+               sum(test_raw$Animal.ID %in% train_raw$Animal.ID))),
+      caption = "Shared modelling sample (one record per animal)")
+```
+
+The template already keeps one record per animal (latest intake), so no animal can appear in
+both training and test, or in two CV folds. This deals with the repeated Animal IDs the
+A1 marker flagged.
+
+## 2. Feature handling for logistic regression
+
+LR is linear in the log-odds, so the factor data from the template need extra work:
+
+* **Encoding:** treatment (dummy) coding learned from the training part only. Reference
+  levels: `Type` = Cat, `Sex` = Female, `has_pattern` = Pure, `has_Name` = 0. For
+  `Spayed.Neutered`, breed group and base colour, the reference is the most common training
+  level, which keeps the coefficient estimates stable.
+* **Scaling:** age is standardised with the training mean/SD (glmnet also standardises
+  columns internally, and coefficients are returned on the original scale).
+* **Type/Age overlap:** the template already recodes Puppy/Kitten into Dog/Cat, so `Type` is
+  species only and life stage comes from age alone. LR assumes a straight-line effect of
+  age, but the EDA shows age is strongly right-skewed and its effect is not linear. So the
+  extended feature set uses a natural spline on `log1p(age)` (3 df) and a Dog × age
+  interaction (age effects can differ by species). It also adds an `age_missing` flag:
+  imputed ages are otherwise indistinguishable from real ones, and missing DOB is itself
+  informative.
+* **Collinearity:** checked with VIFs on the dummy design and Cramér's V between predictors
+  (below). The elastic-net penalty also stabilises correlated dummies.
+* **Class imbalance:** inverse-frequency case weights, $w_c = n / (K n_c)$, from the
+  training part only.
+
+```{r design-helpers}
+# Metrics used by the whole group: macro-F1 (primary), balanced accuracy, per-class recall.
+class_metrics <- function(truth, pred) {
+  truth <- factor(truth, levels = classes); pred <- factor(pred, levels = classes)
+  cm <- table(Truth = truth, Pred = pred)
+  recall <- diag(cm) / rowSums(cm)
+  precision <- ifelse(colSums(cm) > 0, diag(cm) / colSums(cm), 0)
+  f1 <- ifelse(precision + recall > 0, 2 * precision * recall / (precision + recall), 0)
+  list(cm = cm, recall = recall, precision = precision, f1 = f1,
+       summary = c(macro_F1 = mean(f1), balanced_accuracy = mean(recall),
+                   accuracy = sum(diag(cm)) / sum(cm)))
+}
+
+class_weights <- function(y) {
+  w <- length(y) / (length(levels(y)) * as.numeric(table(y)))
+  setNames(w, levels(y))[as.character(y)]
+}
+
+ref_levels <- function(x) {
+  fixed <- c(Type = "Cat", Sex = "Female", has_pattern = "Pure", has_Name = "0")
+  sapply(names(Filter(is.factor, x)), function(v) {
+    if (v %in% names(fixed)) fixed[[v]] else names(which.max(table(x[[v]])))
+  })
+}
+
+# Build train/new design matrices with rules learned from the training part only.
+# spec = "base": shared 8 predictors, linear standardised age.
+# spec = "extended": + ns(log1p(age), 3) + Dog x log-age + age_missing flag.
+build_design <- function(xtr, xnew, miss_tr, miss_new, spec = "base", drop = character(0)) {
+  refs <- ref_levels(xtr)
+  prep <- function(x) {
+    for (v in names(refs)) x[[v]] <- relevel(factor(x[[v]], levels = levels(xtr[[v]])), refs[[v]])
+    x[, setdiff(names(x), c("Age_Years_imputed", drop)), drop = FALSE]
+  }
+  ftr <- prep(xtr); fnew <- prep(xnew)
+  mm <- function(f) model.matrix(~ ., data = f)[, -1, drop = FALSE]
+  Xtr <- mm(ftr); Xnew <- mm(fnew)
+  mu <- mean(xtr$Age_Years_imputed); s <- sd(xtr$Age_Years_imputed)
+  if (spec == "base") {
+    Xtr <- cbind(Xtr, age_z = (xtr$Age_Years_imputed - mu) / s)
+    Xnew <- cbind(Xnew, age_z = (xnew$Age_Years_imputed - mu) / s)
+  } else {
+    la_tr <- log1p(xtr$Age_Years_imputed); la_new <- log1p(xnew$Age_Years_imputed)
+    basis <- ns(la_tr, df = 3)
+    B_tr <- basis; B_new <- predict(basis, la_new)
+    colnames(B_tr) <- colnames(B_new) <- paste0("age_ns", 1:3)
+    lm_ <- mean(la_tr); ls_ <- sd(la_tr)
+    Xtr <- cbind(Xtr, unclass(B_tr)[, 1:3],
+                 dog_x_logage = (xtr$Type == "Dog") * (la_tr - lm_) / ls_,
+                 age_missing = as.numeric(miss_tr))
+    Xnew <- cbind(Xnew, B_new,
+                  dog_x_logage = (xnew$Type == "Dog") * (la_new - lm_) / ls_,
+                  age_missing = as.numeric(miss_new))
+  }
+  colnames(Xtr) <- colnames(Xnew) <- make.names(colnames(Xtr))
+  # Drop any column that is constant in training (zero variance).
+  keep <- apply(Xtr, 2, function(z) length(unique(z)) > 1)
+  list(Xtr = Xtr[, keep, drop = FALSE], Xnew = Xnew[, keep, drop = FALSE])
+}
+
+# Age missing flag (missing DOB or negative age), aligned to template rows.
+miss_train <- is.na(train_raw$Age_Years)
+miss_test <- is.na(test_raw$Age_Years)
+fold_miss <- lapply(seq_along(cv_folds), function(k) list(
+  tr = miss_train[-cv_folds[[k]]], va = miss_train[cv_folds[[k]]]))
+for (k in seq_along(cv_data)) {          # check alignment with the template's cv_data
+  stopifnot(identical(cv_data[[k]]$y_valid, y_train[cv_folds[[k]]]))
+}
+```
+
+### Each predictor's relationship with the outcome (training data)
+
+A1 feedback asked for each predictor to be linked to the outcome. Below, each predictor is
+tested against `Outcome.Group` on the training set only (χ² test and Cramér's V for
+factors; Kruskal–Wallis and ε² for age). The odds ratios in Section 4 give the direction.
+
+```{r feature-outcome}
+assoc <- lapply(names(x_train), function(v) {
+  x <- x_train[[v]]
+  if (is.factor(x)) {
+    tst <- suppressWarnings(chisq.test(table(x, y_train)))
+    V <- sqrt(unname(tst$statistic) / (length(x) * (min(nlevels(x), length(classes)) - 1)))
+    tibble(Predictor = v, Test = "Chi-squared", Statistic = unname(tst$statistic),
+           df = unname(tst$parameter), p_value = tst$p.value, Effect_size = V,
+           Effect_measure = "Cramer's V")
+  } else {
+    tst <- kruskal.test(x ~ y_train)
+    tibble(Predictor = v, Test = "Kruskal-Wallis", Statistic = unname(tst$statistic),
+           df = unname(tst$parameter), p_value = tst$p.value,
+           Effect_size = unname(tst$statistic) / (length(x) - 1), Effect_measure = "epsilon^2")
+  }
+}) %>% bind_rows() %>% arrange(desc(Effect_size))
+write.csv(assoc, "results/feature_outcome_association.csv", row.names = FALSE)
+kable(assoc, digits = 3, caption = "Univariate association with Outcome.Group (training set)")
+
+prop_tab <- function(v) {
+  as.data.frame(prop.table(table(x_train[[v]], y_train), 1)) %>%
+    rename(Level = Var1, Outcome = y_train, Prop = Freq) %>% mutate(Predictor = v)
+}
+prop_long <- bind_rows(lapply(setdiff(names(x_train), "Age_Years_imputed"), prop_tab))
+p_rel <- ggplot(prop_long, aes(x = Level, y = Prop, fill = Outcome)) +
+  geom_col(width = 0.75) + facet_wrap(~ Predictor, scales = "free_x", ncol = 4) +
+  scale_y_continuous(labels = scales::percent) + scale_fill_brewer(palette = "Set2") +
+  labs(x = NULL, y = "Within-level proportion", title = "Outcome mix by predictor level (training set)") +
+  theme_minimal(base_size = 8) +
+  theme(axis.text.x = element_text(angle = 40, hjust = 1), legend.position = "bottom")
+ggsave("results/feature_outcome_proportions.png", p_rel, width = 11, height = 6, dpi = 150)
+p_rel
+```
+
+```{r collinearity}
+X_base <- build_design(x_train, x_train, miss_train, miss_train, "base")$Xtr
+vif <- sapply(colnames(X_base), function(j) {
+  r2 <- summary(lm(X_base[, j] ~ X_base[, -which(colnames(X_base) == j)]))$r.squared
+  1 / (1 - r2)
+})
+vif_tab <- tibble(Column = names(vif), VIF = unname(vif)) %>% arrange(desc(VIF))
+write.csv(vif_tab, "results/vif_base_design.csv", row.names = FALSE)
+
+fac <- names(Filter(is.factor, x_train))
+cramer <- outer(fac, fac, Vectorize(function(a, b) {
+  t <- table(x_train[[a]], x_train[[b]])
+  s <- suppressWarnings(chisq.test(t, correct = FALSE)$statistic)
+  sqrt(unname(s) / (sum(t) * (min(dim(t)) - 1)))
+}))
+dimnames(cramer) <- list(fac, fac)
+kable(head(vif_tab, 6), digits = 2, caption = "Largest VIFs in the dummy-coded base design")
+kable(cramer, digits = 2, caption = "Cramér's V between categorical predictors (training set)")
+```
+
+The highest VIF is `TypeDog` (`r sprintf("%.1f", vif[["TypeDog"]])`) with the breed dummies next. This is
+expected: most top-8 breeds belong to only one species, so breed is partly nested in
+`Type`. `Sex` = Unknown and `Spayed.Neutered` = Unknown also overlap (Cramér's V
+`r sprintf("%.2f", cramer["Sex", "Spayed.Neutered"])`). None of this is perfect aliasing, so all
+predictors are kept, and the elastic-net penalty handles the correlated dummies. Odds ratios for
+Type and breed should be read together, not one at a time.
+
+## 3. Models and tuning (shared 5-fold CV)
+
+Each candidate is scored on the template's `cv_data` folds. All encoding, scaling, splines
+and weights are re-learned inside each fold's training part.
+
+* **M0** – plain `nnet::multinom`, base features, no weights.
+* **M1** – M0 plus inverse-frequency class weights.
+* **M2** – weighted `glmnet` multinomial (grouped penalty), base features. α ∈ {0, 0.25, 0.5, 0.75, 1}
+  and λ are tuned by CV macro-F1.
+* **M3** – M2 with the extended age features (spline, Dog × age, missing flag).
+
+For the glmnet models, λ is chosen with the one-standard-error rule: the largest λ whose CV
+macro-F1 is within one SE of the best. This gives a simpler model at no real cost.
+
+**Why consider regularisation?** With 5 classes and about 25 dummies, there are over 100
+coefficients, some on small groups (Euthanasia, Other, rare colour/breed levels). The
+multinomial lasso/elastic net shrinks these unstable estimates and can drop whole
+predictors (grouped penalty), which is our feature-selection step. Plain LR is kept as the
+unpenalised reference.
+
+```{r cv-models, cache=FALSE}
+alphas <- c(0, 0.25, 0.5, 0.75, 1)
+n_lambda <- 40
+
+fit_multinom <- function(X, y, w = NULL) {
+  df <- data.frame(X, .y = y)
+  if (is.null(w)) w <- rep(1, length(y))
+  multinom(.y ~ ., data = df, weights = w, maxit = 1000, MaxNWts = 10000, trace = FALSE)
+}
+pred_multinom <- function(fit, X) as.character(predict(fit, newdata = data.frame(X), type = "class"))
+
+cv_rows <- list(); fold_rows <- list(); grid_rows <- list(); oof <- list()
+
+# Majority-class reference and plain multinomial models
+for (k in seq_along(cv_data)) {
+  d <- cv_data[[k]]
+  yva <- d$y_valid
+  maj <- names(which.max(table(d$y_train)))
+  m <- class_metrics(yva, rep(maj, length(yva)))
+  fold_rows[[length(fold_rows) + 1]] <- tibble(Model = "Majority class", Fold = k, !!!as.list(m$summary),
+                                               !!!setNames(as.list(m$recall), paste0("recall_", classes)))
+  des <- build_design(d$x_train, d$x_valid, fold_miss[[k]]$tr, fold_miss[[k]]$va, "base")
+  for (mod in c("M0 multinom", "M1 multinom + weights")) {
+    w <- if (mod == "M0 multinom") NULL else class_weights(d$y_train)
+    fit <- fit_multinom(des$Xtr, d$y_train, w)
+    m <- class_metrics(yva, pred_multinom(fit, des$Xnew))
+    fold_rows[[length(fold_rows) + 1]] <- tibble(Model = mod, Fold = k, !!!as.list(m$summary),
+                                                 !!!setNames(as.list(m$recall), paste0("recall_", classes)))
+  }
+}
+
+# glmnet: shared lambda path per alpha from the full training data, then fold scores
+tune_glmnet <- function(spec) {
+  full <- build_design(x_train, x_train, miss_train, miss_train, spec)
+  res <- list()
+  for (a in alphas) {
+    path <- glmnet(full$Xtr, y_train, family = "multinomial", type.multinomial = "grouped",
+                   alpha = a, weights = class_weights(y_train), nlambda = n_lambda,
+                   lambda.min.ratio = 1e-4)$lambda
+    for (k in seq_along(cv_data)) {
+      d <- cv_data[[k]]
+      des <- build_design(d$x_train, d$x_valid, fold_miss[[k]]$tr, fold_miss[[k]]$va, spec)
+      fit <- glmnet(des$Xtr, d$y_train, family = "multinomial", type.multinomial = "grouped",
+                    alpha = a, weights = class_weights(d$y_train), lambda = path)
+      pr <- predict(fit, des$Xnew, type = "class")
+      for (j in seq_along(path)) {
+        m <- class_metrics(d$y_valid, pr[, j])
+        res[[length(res) + 1]] <- tibble(spec = spec, alpha = a, lambda = path[j], Fold = k,
+                                         !!!as.list(m$summary),
+                                         !!!setNames(as.list(m$recall), paste0("recall_", classes)))
+      }
+    }
+  }
+  bind_rows(res)
+}
+grid <- bind_rows(tune_glmnet("base"), tune_glmnet("extended"))
+
+grid_summary <- grid %>% group_by(spec, alpha, lambda) %>%
+  summarise(mean_macro_F1 = mean(macro_F1), se_macro_F1 = sd(macro_F1) / sqrt(n()),
+            mean_bal_acc = mean(balanced_accuracy), .groups = "drop")
+write.csv(grid_summary, "results/glmnet_tuning_grid.csv", row.names = FALSE)
+
+pick_1se <- function(s) {
+  best <- s[which.max(s$mean_macro_F1), ]
+  cand <- s %>% filter(alpha == best$alpha, mean_macro_F1 >= best$mean_macro_F1 - best$se_macro_F1)
+  list(best = best, one_se = cand[which.max(cand$lambda), ])
+}
+sel <- lapply(c(base = "base", extended = "extended"),
+              function(sp) pick_1se(filter(grid_summary, spec == sp)))
+
+for (sp in names(sel)) {
+  ch <- sel[[sp]]$one_se
+  rows <- grid %>% filter(spec == sp, alpha == ch$alpha, lambda == ch$lambda) %>%
+    mutate(Model = if (sp == "base") "M2 glmnet + weights" else "M3 glmnet + weights + age features") %>%
+    select(Model, Fold, macro_F1, balanced_accuracy, accuracy, starts_with("recall_"))
+  fold_rows[[length(fold_rows) + 1]] <- rows
+}
+fold_metrics <- bind_rows(fold_rows)
+write.csv(fold_metrics, "results/cv_fold_metrics.csv", row.names = FALSE)
+
+cv_summary <- fold_metrics %>% group_by(Model) %>%
+  summarise(macro_F1_sd = sd(macro_F1),
+            across(c(macro_F1, balanced_accuracy, accuracy, starts_with("recall_")), mean),
+            .groups = "drop") %>%
+  relocate(macro_F1_sd, .after = macro_F1) %>% arrange(desc(macro_F1))
+write.csv(cv_summary, "results/cv_model_comparison.csv", row.names = FALSE)
+kable(cv_summary, digits = 3, caption = "5-fold CV results (mean over the shared folds)")
+
+tuned_tab <- bind_rows(lapply(names(sel), function(sp) bind_rows(
+  mutate(sel[[sp]]$best, rule = "best (lambda.min)"),
+  mutate(sel[[sp]]$one_se, rule = "1-SE (used)"))))
+kable(tuned_tab %>% select(spec, rule, alpha, lambda, mean_macro_F1, se_macro_F1, mean_bal_acc),
+      digits = 4, caption = "Selected glmnet hyperparameters")
+```
+
+```{r tuning-plot, fig.width=9, fig.height=3.4}
+p_tune <- ggplot(grid_summary, aes(x = log10(lambda), y = mean_macro_F1, colour = factor(alpha))) +
+  geom_line() + facet_wrap(~ spec) +
+  geom_vline(data = bind_rows(lapply(names(sel), function(sp) sel[[sp]]$one_se)),
+             aes(xintercept = log10(lambda)), linetype = "dashed") +
+  labs(x = expression(log[10](lambda)), y = "CV macro-F1", colour = expression(alpha),
+       title = "Elastic-net tuning on the shared folds (dashed = 1-SE choice)") +
+  theme_minimal(base_size = 9)
+ggsave("results/glmnet_tuning_curve.png", p_tune, width = 9, height = 3.4, dpi = 150)
+p_tune
+```
+
+```{r choose-final}
+lr_models <- cv_summary %>% filter(Model != "Majority class")
+final_name <- lr_models$Model[1]
+final_spec <- if (grepl("age features", final_name)) "extended" else "base"
+final_is_glmnet <- grepl("glmnet", final_name)
+final_weighted <- grepl("weights", final_name)
+final_alpha <- if (final_is_glmnet) sel[[final_spec]]$one_se$alpha else NA
+final_lambda <- if (final_is_glmnet) sel[[final_spec]]$one_se$lambda else NA
+```
+
+**Chosen LR model:** `r final_name` (highest mean CV macro-F1 =
+`r sprintf("%.3f", lr_models$macro_F1[1])`). `r if (final_is_glmnet) sprintf("Tuned values: alpha = %s, lambda = %.5f.", final_alpha, final_lambda) else ""`
+
+## 4. Final fit, held-out test and interpretation
+
+The chosen model is refit on the full `x_train`/`y_train` and evaluated **once** on
+`x_test`/`y_test`.
+
+```{r final-fit}
+fit_final <- function(xtr, ytr, xnew, mtr, mnew, drop = character(0)) {
+  des <- build_design(xtr, xnew, mtr, mnew, final_spec, drop)
+  w <- if (final_weighted) class_weights(ytr) else NULL
+  if (final_is_glmnet) {
+    fit <- glmnet(des$Xtr, ytr, family = "multinomial", type.multinomial = "grouped",
+                  alpha = final_alpha, weights = w, lambda = final_lambda)
+    prob <- predict(fit, des$Xnew, type = "response")[, , 1]
+  } else {
+    fit <- fit_multinom(des$Xtr, ytr, w)
+    prob <- predict(fit, newdata = data.frame(des$Xnew), type = "probs")
+  }
+  list(fit = fit, prob = prob, pred = classes[max.col(prob, ties.method = "first")],
+       cols = colnames(des$Xtr))
+}
+final <- fit_final(x_train, y_train, x_test, miss_train, miss_test)
+test_m <- class_metrics(y_test, final$pred)
+
+cv_final <- cv_summary %>% filter(Model == final_name)
+metrics_out <- bind_rows(
+  tibble(Model = final_name, Evaluation = "5-fold CV (mean)", macro_F1 = cv_final$macro_F1,
+         balanced_accuracy = cv_final$balanced_accuracy, accuracy = cv_final$accuracy,
+         !!!as.list(unlist(cv_final[paste0("recall_", classes)]))),
+  tibble(Model = final_name, Evaluation = "Held-out test (20%)", !!!as.list(test_m$summary),
+         !!!setNames(as.list(test_m$recall), paste0("recall_", classes))))
+write.csv(metrics_out, "results/metrics_summary.csv", row.names = FALSE)
+kable(metrics_out, digits = 3, caption = "Final LR model: CV vs held-out test")
+
+per_class <- tibble(Class = classes, n_test = as.numeric(table(y_test)),
+                    Precision = test_m$precision, Recall = test_m$recall, F1 = test_m$f1)
+write.csv(per_class, "results/test_per_class.csv", row.names = FALSE)
+kable(per_class, digits = 3, caption = "Per-class test performance")
+
+write.csv(data.frame(Animal.ID = test_raw$Animal.ID, truth = y_test, pred = final$pred,
+                     round(final$prob, 5), check.names = FALSE),
+          "results/test_predictions.csv", row.names = FALSE)
+```
+
+```{r confusion-matrix, fig.width=6, fig.height=4.6, out.width="60%"}
+cm_df <- as.data.frame(test_m$cm) %>% group_by(Truth) %>%
+  mutate(Row_pct = Freq / sum(Freq)) %>% ungroup()
+write.csv(as.data.frame.matrix(test_m$cm), "results/confusion_matrix_test.csv")
+p_cm <- ggplot(cm_df, aes(x = Pred, y = forcats::fct_rev(Truth), fill = Row_pct)) +
+  geom_tile(colour = "white") +
+  geom_text(aes(label = sprintf("%d\n(%.0f%%)", Freq, 100 * Row_pct)), size = 3) +
+  scale_fill_gradient(low = "#F0F4F8", high = "#1F78B4", labels = scales::percent) +
+  labs(x = "Predicted", y = "Actual", fill = "Row %",
+       title = "Logistic regression – held-out test confusion matrix") +
+  theme_minimal(base_size = 10) + theme(panel.grid = element_blank())
+ggsave("results/confusion_matrix_test.png", p_cm, width = 6, height = 4.6, dpi = 150)
+p_cm
+```
+
+```{r oof-predictions}
+# Out-of-fold predictions of the chosen model (useful for the group comparison).
+oof_df <- bind_rows(lapply(seq_along(cv_data), function(k) {
+  d <- cv_data[[k]]
+  r <- fit_final(d$x_train, d$y_train, d$x_valid, fold_miss[[k]]$tr, fold_miss[[k]]$va)
+  data.frame(train_row = cv_folds[[k]], Animal.ID = train_raw$Animal.ID[cv_folds[[k]]],
+             Fold = k, truth = d$y_valid, pred = r$pred, round(r$prob, 5), check.names = FALSE)
+})) %>% arrange(train_row)
+write.csv(oof_df, "results/cv_oof_predictions.csv", row.names = FALSE)
+```
+
+### Coefficients and odds ratios
+
+For explaining effects to stakeholders I use the **unpenalised, unweighted multinomial
+model on the base features**, fitted on the full training set, with age in years. This gives
+ordinary odds ratios with Wald 95% CIs, relative to the **Adoption** outcome. (Penalised
+coefficients are biased towards 1, and weights shift the intercepts.) The selected model's
+own coefficients are saved too (`results/final_model_coefficients.csv`).
+
+```{r odds-ratios}
+des_or <- build_design(x_train, x_test, miss_train, miss_test, "base")
+X_or <- des_or$Xtr
+X_or[, "age_z"] <- x_train$Age_Years_imputed          # odds ratio per year of age
+colnames(X_or)[colnames(X_or) == "age_z"] <- "Age_years"
+fit_or <- fit_multinom(X_or, y_train)
+co <- coef(fit_or); se <- summary(fit_or)$standard.errors
+or_tab <- expand.grid(Outcome = rownames(co), Term = colnames(co), stringsAsFactors = FALSE) %>%
+  mutate(coef = co[cbind(Outcome, Term)], se = se[cbind(Outcome, Term)],
+         OR = exp(coef), OR_low = exp(coef - 1.96 * se), OR_high = exp(coef + 1.96 * se),
+         p_value = 2 * pnorm(-abs(coef / se))) %>%
+  filter(Term != "(Intercept)") %>% arrange(Outcome, Term)
+write.csv(or_tab, "results/odds_ratios_vs_adoption.csv", row.names = FALSE)
+
+# Likelihood-ratio test for dropping each predictor (overall contribution)
+drop_lr <- bind_rows(lapply(setdiff(names(x_train), character(0)), function(v) {
+  cols <- if (v == "Age_Years_imputed") "Age_years" else grep(paste0("^", make.names(v)), colnames(X_or), value = TRUE)
+  f0 <- fit_multinom(X_or[, setdiff(colnames(X_or), cols), drop = FALSE], y_train)
+  lr <- deviance(f0) - deviance(fit_or); dfree <- length(cols) * (length(classes) - 1)
+  tibble(Predictor = v, LR_chisq = lr, df = dfree, p_value = pchisq(lr, dfree, lower.tail = FALSE))
+})) %>% arrange(desc(LR_chisq))
+write.csv(drop_lr, "results/drop1_likelihood_ratio.csv", row.names = FALSE)
+kable(drop_lr, digits = 3, caption = "Drop-one likelihood-ratio tests (unpenalised multinomial, training set)")
+
+if (final_is_glmnet) {
+  cf <- coef(final$fit)
+  final_coef <- bind_rows(lapply(names(cf), function(cl) tibble(
+    Outcome = cl, Term = rownames(cf[[cl]]), coef = as.numeric(cf[[cl]]))))
+} else {
+  cf <- coef(final$fit)
+  final_coef <- as.data.frame(as.table(cf)) %>% rename(Outcome = Var1, Term = Var2, coef = Freq)
+}
+write.csv(final_coef, "results/final_model_coefficients.csv", row.names = FALSE)
+if (final_is_glmnet) {
+  zero_terms <- final_coef %>% filter(Term != "(Intercept)") %>% group_by(Term) %>%
+    summarise(all_zero = all(coef == 0)) %>% filter(all_zero) %>% pull(Term)
+}
+```
+
+```{r or-plot, fig.width=10, fig.height=6}
+p_or <- or_tab %>%
+  mutate(Term = gsub("^primary\\.breed\\.group", "Breed: ", Term),
+         Term = gsub("^Base_Color", "Colour: ", Term),
+         Term = gsub("^Spayed\\.Neutered", "Spayed/Neutered: ", Term),
+         Term = gsub("^has_pattern", "Pattern: ", Term)) %>%
+  ggplot(aes(x = OR, y = Term)) +
+  geom_vline(xintercept = 1, linetype = "dashed", colour = "grey50") +
+  geom_errorbarh(aes(xmin = OR_low, xmax = OR_high), height = 0.2, colour = "grey40") +
+  geom_point(size = 1.4, colour = "#1F78B4") +
+  scale_x_log10() + facet_wrap(~ Outcome, nrow = 1) +
+  labs(x = "Odds ratio vs Adoption (log scale, 95% CI)", y = NULL,
+       title = "Multinomial LR odds ratios (reference outcome = Adoption)") +
+  theme_minimal(base_size = 8)
+ggsave("results/odds_ratios_vs_adoption.png", p_or, width = 10, height = 6, dpi = 150)
+p_or
+```
+
+```{r or-highlights}
+key_terms <- c("TypeDog", "Age_years", "has_Name1", "Spayed.NeuteredNo", "Spayed.NeuteredUnknown",
+               "SexUnknown", "has_patternMixed")
+kable(or_tab %>% filter(Term %in% key_terms) %>%
+        transmute(Outcome, Term, OR = sprintf("%.2f (%.2f–%.2f)", OR, OR_low, OR_high)) %>%
+        pivot_wider(names_from = Outcome, values_from = OR),
+      caption = "Selected odds ratios vs Adoption, OR (95% CI)")
+or_of <- function(term, out) sprintf("%.2f", or_tab$OR[or_tab$Term == term & or_tab$Outcome == out])
+```
+
+**What this means for shelter staff** (associations, not causal effects; other predictors are
+held fixed):
+
+* **Age:** each extra year multiplies the odds of Euthanasia rather than Adoption by
+  `r or_of("Age_years", "Euthanasia")`, and of Return by `r or_of("Age_years", "Return")`. Older
+  animals are the group that needs early adoption promotion or owner tracing.
+* **Name recorded:** having a name cuts the odds of Transfer (vs Adoption) to
+  `r or_of("has_Name1", "Transfer")` times, and of Euthanasia to `r or_of("has_Name1", "Euthanasia")` times.
+  Unnamed animals are a practical flag for early contact with rescue/transfer partners.
+* **Spayed/Neutered:** the odds ratios for "No"/"Unknown" vs "Yes" are huge (for example,
+  `r or_of("Spayed.NeuteredNo", "Transfer")` for Transfer). This is too strong to be a believable
+  intake effect. Desexing is usually done before adoption, so this field probably records
+  status at outcome. It is the clearest leakage risk in our shared predictor set (see Section 5).
+* **Sex unknown** is linked to non-adoption outcomes (OR `r or_of("SexUnknown", "Transfer")` for
+  Transfer), probably because these are animals processed quickly.
+* **Colour and pattern** add little: the drop-one test for `Base_Color` is not significant, and
+  the selected elastic net sets these colour and breed dummies to exactly zero for every
+  outcome: `r if (final_is_glmnet) paste(zero_terms, collapse = ", ") else "n/a"`.
+
+## 5. Sensitivity checks
+
+**(a) Possible leakage in `Spayed.Neutered` and `Name`.** These fields may be recorded at
+outcome rather than at intake (for example, desexing before adoption, or naming in care).
+The chosen model is re-run on the same CV folds without them.
+
+**(b) Temporal hold-out.** The A1 marker asked about a temporal split. The shared split is
+random, which keeps all five models comparable. As an extra check, the same shared rules
+(steps 8–10 of the template: age medians, top-8 breeds, factor levels) are re-learned on
+animals whose outcome was before 2026-07-01, and the chosen model (same hyperparameters) is
+tested on later outcomes.
+
+```{r sensitivity}
+sens <- list()
+for (dr in list(c("Spayed.Neutered"), c("Spayed.Neutered", "has_Name"))) {
+  sc <- sapply(seq_along(cv_data), function(k) {
+    d <- cv_data[[k]]
+    r <- fit_final(d$x_train, d$y_train, d$x_valid, fold_miss[[k]]$tr, fold_miss[[k]]$va, drop = dr)
+    class_metrics(d$y_valid, r$pred)$summary
+  })
+  sens[[length(sens) + 1]] <- tibble(Check = paste("CV without", paste(dr, collapse = " + ")),
+                                     !!!as.list(rowMeans(sc)))
+}
+
+# Temporal hold-out: replicate the template's training-only rules (steps 8-10).
+apply_shared_rules <- function(tr, new) {
+  med_all <- median(tr$Age_Years, na.rm = TRUE)
+  meds <- tr %>% group_by(Type) %>% summarise(Age_Median = median(Age_Years, na.rm = TRUE), .groups = "drop")
+  top8 <- tr %>% filter(Primary.Breed != "Unknown") %>% count(Primary.Breed, name = "Count") %>%
+    arrange(desc(Count), Primary.Breed) %>% filter(row_number() <= 8) %>% pull(Primary.Breed)
+  f <- function(df) df %>% left_join(meds, by = "Type") %>%
+    mutate(Age_Years_imputed = case_when(!is.na(Age_Years) ~ Age_Years, !is.na(Age_Median) ~ Age_Median,
+                                         TRUE ~ med_all),
+           primary.breed.group = if_else(Primary.Breed %in% top8, Primary.Breed, "Other")) %>%
+    select(all_of(model_predictors))
+  a <- f(tr); b <- f(new)
+  for (v in factor_predictors) { a[[v]] <- factor(a[[v]]); b[[v]] <- factor(b[[v]], levels = levels(a[[v]])) }
+  list(x_tr = a, x_new = b)
+}
+outcome_dt <- as.Date(lubridate::parse_date_time(as.character(data_features$Outcome.Date),
+                      orders = c("mdy IMS p", "mdy HMS", "ymd HMS"), locale = "C", tz = "UTC", quiet = TRUE))
+stopifnot(!anyNA(outcome_dt))
+cut_date <- as.Date("2026-07-01")
+tr_t <- data_features[outcome_dt < cut_date, ]; te_t <- data_features[outcome_dt >= cut_date, ]
+sr <- apply_shared_rules(tr_t, te_t)
+ok <- complete.cases(sr$x_new)
+r_t <- fit_final(sr$x_tr, tr_t$Outcome.Group, sr$x_new[ok, ], is.na(tr_t$Age_Years), is.na(te_t$Age_Years)[ok])
+m_t <- class_metrics(te_t$Outcome.Group[ok], r_t$pred)
+sens[[length(sens) + 1]] <- tibble(Check = sprintf("Temporal hold-out (train n=%d, test n=%d, outcome >= %s)",
+                                                   nrow(tr_t), sum(ok), cut_date), !!!as.list(m_t$summary))
+sens_tab <- bind_rows(tibble(Check = "Reference: chosen model, held-out test", !!!as.list(test_m$summary)),
+                      tibble(Check = "Reference: chosen model, CV", macro_F1 = cv_final$macro_F1,
+                             balanced_accuracy = cv_final$balanced_accuracy, accuracy = cv_final$accuracy),
+                      bind_rows(sens))
+write.csv(sens_tab, "results/sensitivity_checks.csv", row.names = FALSE)
+kable(sens_tab, digits = 3, caption = "Sensitivity checks for the chosen LR model")
+
+drift <- bind_rows(
+  as.data.frame(prop.table(table(tr_t$Outcome.Group))) %>% mutate(Period = "Train (before cut-off)"),
+  as.data.frame(prop.table(table(te_t$Outcome.Group))) %>% mutate(Period = "Test (after cut-off)")) %>%
+  pivot_wider(names_from = Var1, values_from = Freq)
+kable(drift, digits = 3, caption = "Outcome mix before/after the temporal cut-off")
+```
+
+Dropping `Spayed.Neutered` lowers CV macro-F1 from `r sprintf("%.3f", cv_final$macro_F1)` to
+`r sprintf("%.3f", sens_tab$macro_F1[3])`, so much of this model's signal depends on a field whose
+intake-time availability is uncertain. The group should decide this jointly, because it affects
+every model. On the temporal hold-out, macro-F1 is `r sprintf("%.3f", m_t$summary["macro_F1"])`, slightly
+below the random-split test. That is a mild drop, consistent with the outcome mix shifting over time.
+
+## 6. Summary
+
+```{r summary-numbers, include=FALSE}
+cvf <- cv_summary %>% filter(Model == final_name)
+m0 <- cv_summary %>% filter(Model == "M0 multinom")
+maj <- cv_summary %>% filter(Model == "Majority class")
+```
+
+* Chosen model: **`r final_name`**. CV macro-F1 `r sprintf("%.3f", cvf$macro_F1)`
+  (balanced accuracy `r sprintf("%.3f", cvf$balanced_accuracy)`). Held-out test macro-F1
+  `r sprintf("%.3f", test_m$summary["macro_F1"])`, balanced accuracy
+  `r sprintf("%.3f", test_m$summary["balanced_accuracy"])`, accuracy
+  `r sprintf("%.3f", test_m$summary["accuracy"])`.
+* Comparison on CV: the unweighted plain LR (M0) gets macro-F1 `r sprintf("%.3f", m0$macro_F1)`, and
+  always predicting Adoption gets `r sprintf("%.3f", maj$macro_F1)`.
+* Class weighting is what makes LR usable here. Without weights, plain LR mostly predicts
+  Adoption/Transfer and almost never Euthanasia or Other. Adding the age features and the
+  elastic-net penalty gives a further small CV gain, mainly in Return and Euthanasia recall.
+* Test recall by class: `r paste(sprintf("%s %.2f", classes, test_m$recall), collapse = ", ")`.
