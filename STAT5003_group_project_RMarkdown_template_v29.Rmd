@@ -62,7 +62,9 @@ Animal center accepts a variety of animals from wildlife to owned pet. Our datas
 
 **Task and relevance:** Predict the final outcome of cats and dogs—Adoption, Transfer, Return, Euthanasia, or Other—from information available at intake. This real-world task is relevant to shelters managing overcrowding and limited resources.
 
-**Stakeholders:** Shelter staff, animal-care teams, adoption and transfer coordinators, and managers allocating shelter resources.
+**Stakeholders:** 
+1. **Intake Triage Officers**: Require immediate prognostication within the initial 24-hour admission window to proactively stratify care, flagging incoming animals at high risk of prolonged confinement or medical deterioration for targeted behavioural rehabilitation and veterinary intervention before irreversible outcomes occur.
+2. **Transfer & Foster Coordinators**: Rely on intake-stage probability trajectories to initiate partner rescue placement and foster network scheduling weeks in advance, preventing kennel bottlenecks and reducing overall Length of Stay (LOS).
 
 **Research question:** To what extent can intake-time information of cats and dogs predict these five shelter outcomes for each animal's latest recorded admission?
 
@@ -1137,10 +1139,169 @@ for (k in 1:5) {
 3.  **Class imbalance:** Imbalance will be handled by passing per-observation weight values (inverse class frequency) into `xgb.DMatrix`, so that the rare Euthanasia and Other classes contribute proportionally more to the training loss than their raw counts would suggest.
 4.  **Evaluation:** Evaluated via shared outcome-stratified CV using macro-F1, balanced accuracy, and per-class recall. XGBoost's feature importance will be interpreted alongside correlated predictors and validation results; it does not establish an independent or causal contribution.
 
-```{r fit-xgboost, eval=FALSE}
+```{r fit-xgboost, eval=FALSE, warning=FALSE, message=FALSE}
+library(xgboost)
+library(caret)
+library(dplyr)
 
+# 2. define Macro-F1 function
+calc_macro_f1 <- function(actual, predicted, classes) {
+  f1s <- sapply(classes, function(cl) {
+    tp <- sum(actual == cl & predicted == cl)
+    fp <- sum(actual != cl & predicted == cl)
+    fn <- sum(actual == cl & predicted != cl)
+    prec <- ifelse(tp + fp == 0, 0, tp / (tp + fp))
+    rec  <- ifelse(tp + fn == 0, 0, tp / (tp + fn))
+    ifelse(prec + rec == 0, 0, 2 * prec * rec / (prec + rec))
+  })
+  mean(f1s, na.rm = TRUE)
+}
+
+# 3. baseline model for 5-Fold CV
+baseline_cv_f1 <- numeric(5)
+
+for (k in 1:5) {
+  # kth fold
+  fold_xtrain <- cv_data[[k]]$x_train
+  fold_ytrain <- cv_data[[k]]$y_train
+  fold_xvalid <- cv_data[[k]]$x_valid
+  fold_yvalid <- cv_data[[k]]$y_valid
+  
+  # train kth data
+  dmy <- dummyVars(~ ., data = fold_xtrain, fullRank = FALSE)
+  m_train <- predict(dmy, newdata = fold_xtrain)
+  m_valid <- predict(dmy, newdata = fold_xvalid)
+  
+  # convert to 0-indexed labels (XGBoost)
+  lbl_train <- as.integer(fold_ytrain) - 1
+  lbl_valid <- as.integer(fold_yvalid) - 1
+  
+  dtrain <- xgb.DMatrix(data = m_train, label = lbl_train)
+  dvalid <- xgb.DMatrix(data = m_valid, label = lbl_valid)
+  
+  # Baseline 
+  base_params <- list(
+    booster     = "gbtree",
+    objective   = "multi:softprob",
+    num_class   = n_classes,
+    eval_metric = "mlogloss",
+    max_depth   = 6,
+    eta         = 0.3
+  )
+  
+  bst_base <- xgb.train(
+    params  = base_params,
+    data    = dtrain,
+    nrounds = 100,
+    verbose = 0
+  )
+  
+  # predict and calculate the fold's Macro-F1
+  probs <- predict(bst_base, dvalid, reshape = TRUE)
+  preds <- max.col(probs) - 1
+  pred_factor <- factor(outcome_levels[preds + 1], levels = outcome_levels)
+  
+  baseline_cv_f1[k] <- calc_macro_f1(fold_yvalid, pred_factor, outcome_levels)
+}
+
+cat(sprintf("Baseline XGBoost 5-Fold CV Macro-F1: %.4f (± %.4f)\n", 
+            mean(baseline_cv_f1), sd(baseline_cv_f1)))
 ```
 
+```{r fit-xgboost, eval=FALSE, warning=FALSE, message=FALSE}
+
+# ==============================================================================
+# Model Improvement: Cost-Sensitive + Grid Search
+# ==============================================================================
+
+# hyperparameters
+tuning_grid <- expand.grid(
+  max_depth        = c(4, 6),
+  eta              = c(0.05, 0.10),
+  subsample        = c(0.80),
+  colsample_bytree = c(0.70, 0.85),
+  min_child_weight = c(1, 3)
+)
+
+best_macro_f1 <- -Inf
+best_config   <- NULL
+config_results <- numeric(nrow(tuning_grid))
+
+cat(sprintf("Evaluating %d th hyperparameter (5-Fold CV)...\n", nrow(tuning_grid)))
+
+for (cfg in 1:nrow(tuning_grid)) {
+  current_params <- tuning_grid[cfg, ]
+  fold_f1s <- numeric(5)
+  
+  for (k in 1:5) {
+    fold_xtrain <- cv_data[[k]]$x_train
+    fold_ytrain <- cv_data[[k]]$y_train
+    fold_xvalid <- cv_data[[k]]$x_valid
+    fold_yvalid <- cv_data[[k]]$y_valid
+    
+    dmy <- dummyVars(~ ., data = fold_xtrain, fullRank = FALSE)
+    m_train <- predict(dmy, newdata = fold_xtrain)
+    m_valid <- predict(dmy, newdata = fold_xvalid)
+    
+    lbl_train <- as.integer(fold_ytrain) - 1
+    lbl_valid <- as.integer(fold_yvalid) - 1
+    
+    # calculate the weight of each category in each Fold
+    class_counts <- table(fold_ytrain)
+    weights_per_class <- nrow(fold_xtrain) / (length(class_counts) * class_counts)
+    sample_weights <- as.numeric(weights_per_class[as.character(fold_ytrain)])
+    
+    dtrain <- xgb.DMatrix(data = m_train, label = lbl_train, weight = sample_weights)
+    dvalid <- xgb.DMatrix(data = m_valid, label = lbl_valid)
+    
+    model_params <- list(
+      booster          = "gbtree",
+      objective        = "multi:softprob",
+      num_class        = n_classes,
+      eval_metric      = "mlogloss",
+      max_depth        = current_params$max_depth,
+      eta              = current_params$eta,
+      subsample        = current_params$subsample,
+      colsample_bytree = current_params$colsample_bytree,
+      min_child_weight = current_params$min_child_weight
+    )
+    
+    bst_tuned <- xgb.train(
+      params                = model_params,
+      data                  = dtrain,
+      nrounds               = 250,
+      watchlist             = list(eval = dvalid),
+      early_stopping_rounds = 20,
+      verbose               = 0
+    )
+    
+    probs <- predict(bst_tuned, dvalid, reshape = TRUE)
+    preds <- max.col(probs) - 1
+    pred_factor <- factor(outcome_levels[preds + 1], levels = outcome_levels)
+    
+    fold_f1s[k] <- calc_macro_f1(fold_yvalid, pred_factor, outcome_levels)
+  }
+  
+  mean_f1 <- mean(fold_f1s)
+  config_results[cfg] <- mean_f1
+  
+  if (mean_f1 > best_macro_f1) {
+    best_macro_f1 <- mean_f1
+    best_config   <- current_params
+  }
+}
+
+# 2. result
+cat("\n=======================================================\n")
+cat("                 CV For Tuning (XGBoost)               \n")
+cat("=======================================================\n")
+cat(sprintf("Baseline CV Macro-F1  : %.4f\n", mean(baseline_cv_f1)))
+cat(sprintf("Weighted CV Macro-F1  : %.4f\n", best_macro_f1))
+cat(sprintf("Macro-F1 Difference            : +%.4f\n", best_macro_f1 - mean(baseline_cv_f1)))
+cat("\nBest Parameter:\n")
+print(best_config)
+
+```
 ### Random Forest
 
 1.  **Purpose and justification:** Random Forest is a non-linear ensemble model and it is suitable for classification. By averaging many decision trees built from bootstrap samples and random subsets of predictors, Random Forest can reduce the variance and overfitting of a single decision tree.
