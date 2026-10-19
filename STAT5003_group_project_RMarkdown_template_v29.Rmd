@@ -1143,22 +1143,43 @@ for (k in 1:5) {
 
 ### Random Forest
 
-1.  **Purpose and justification:** Random Forest is a non-linear ensemble model and it is suitable for classification. By averaging many decision trees built from bootstrap samples and random subsets of predictors, Random Forest can reduce the variance and overfitting of a single decision tree.
-2.  **Predictors and preprocessing:** We will use the same predictor set as the Multinomial Logistic Regression model. Categorical predictors will be one-hot encoded where required by the implementation. `Age_Years_imputed` will remain on its original scale as in Gradient Boosting because it is also tree-based model.
-3.  **Class imbalance:** We will apply class weighting so that rare outcomes, particularly Euthanasia and Other, receive greater influence during model training rather than being dominated by the majority Adoption class.
-4.  **Evaluation:** Follow the shared outcome-stratified cross-validation plan, using macro-F1 as the primary metric together with balanced accuracy, per-class recall, and a confusion matrix. Feature importance will also be examined to identify which animal characteristics contribute most to prediction and to compare with the XGBoost importance ranking.
+Random Forest combines many decision trees to capture non-linear relationships and reduce the variance of a single tree. We use the same eight predictors as the other models, keeping categorical variables as factors and age on its original scale.
 
+**Baseline model.** We first fit a Random Forest with default settings: 500 trees and two randomly selected predictors at each split. No class weights are applied. Performance is assessed using macro-F1, balanced accuracy (mean class recall), and overall accuracy.
 ```{r fit-random-forest, eval=FALSE}
-# CV inputs: cv_data[[k]]$x_train, $y_train, $x_valid and $y_valid.
-# Final refit: x_train, y_train. Final evaluation: x_test, y_test.
-# Additional preprocessing 11: use the common factor data if the chosen package
-# supports factors. Otherwise, encode here using training levels and align
-# validation/test columns; remove training-constant inputs if required.
-# If encoding is needed, name the copies x_train_encoded and x_test_encoded.
-# Additional preprocessing 12: leave age unscaled. Calculate any class weights
-# from this training part's outcome frequencies only.
-# Use y_train/y_test as the response; x_train/x_test contain predictors only.
-# TODO: fit Random Forest and retain out-of-fold predictions.
+library(ranger)
+
+# Train the baseline model using default settings.
+rf_baseline <- ranger(x = x_train, y = y_train, seed = 5003)
+
+# Predict the test outcomes.
+rf_baseline_pred <- predict(rf_baseline, data = x_test)$predictions
+
+# Calculate recall and F1 for each outcome by counting observations.
+rf_baseline_recall <- c()
+rf_baseline_f1 <- c()
+
+for (class in levels(y_test)) {
+  # Number of animals actually in this class.
+  actual_count <- sum(y_test == class)
+
+  # Number of animals predicted to be in this class.
+  predicted_count <- sum(rf_baseline_pred == class)
+
+  # Number correctly predicted to be in this class.
+  correct_count <- sum(y_test == class & rf_baseline_pred == class)
+
+  rf_baseline_recall[class] <- correct_count / actual_count
+  rf_baseline_f1[class] <- 2 * correct_count / (actual_count + predicted_count)
+}
+
+rf_baseline_results <- data.frame(
+  Model = "Baseline RF",
+  Macro_F1 = mean(rf_baseline_f1),
+  Balanced_Accuracy = mean(rf_baseline_recall),
+  Accuracy = mean(rf_baseline_pred == y_test)
+)
+knitr::kable(rf_baseline_results, digits = 4)
 ```
 
 ### Support Vector Machine (SVM)
@@ -1191,7 +1212,51 @@ for (k in 1:5) {
 
 ### Improvement Results
 
+#### Random Forest: hyperparameter tuning
 
+We tune the number of trees (`num.trees`: 100, 300, 500) and the number of predictors considered at each split (`mtry`: 2, 4, 8). All other settings remain at their defaults. Each combination is evaluated using the shared five-fold cross-validation data, and the combination with the highest mean macro-F1 is selected. Test results are not used to choose the parameters.
+```{r rf-tuning, eval=FALSE}
+rf_grid <- expand.grid(num.trees = c(100, 300, 500), mtry = c(2, 4, 8))
+rf_cv_results <- data.frame()
+
+# Try each parameter combination on the same five folds.
+for (i in 1:nrow(rf_grid)) {
+  for (k in seq_along(cv_data)) {
+    fold <- cv_data[[k]]
+    rf_model <- ranger(
+      x = fold$x_train, y = fold$y_train,
+      num.trees = rf_grid$num.trees[i],
+      mtry = rf_grid$mtry[i], seed = 5003 + k
+    )
+    preds <- predict(rf_model, data = fold$x_valid)$predictions
+    # Calculate F1 for each outcome in this validation fold.
+    rf_fold_f1 <- c()
+    for (class in levels(fold$y_valid)) {
+      actual_count <- sum(fold$y_valid == class)
+      predicted_count <- sum(preds == class)
+      correct_count <- sum(fold$y_valid == class & preds == class)
+
+      rf_fold_f1[class] <- 2 * correct_count / (actual_count + predicted_count)
+    }
+
+    rf_cv_results <- rbind(rf_cv_results, data.frame(
+      num.trees = rf_grid$num.trees[i], mtry = rf_grid$mtry[i],
+      Fold = k, Macro_F1 = mean(rf_fold_f1)
+    ))
+  }
+}
+
+# Average the validation scores and select the best combination.
+rf_cv_summary <- rf_cv_results %>%
+  group_by(num.trees, mtry) %>%
+  summarise(Mean_Macro_F1 = mean(Macro_F1),
+            SD_Macro_F1 = sd(Macro_F1), .groups = "drop")
+rf_best <- rf_cv_summary[which.max(rf_cv_summary$Mean_Macro_F1), ]
+rf_baseline_cv <- rf_cv_summary %>% filter(num.trees == 500, mtry == 2)
+knitr::kable(rf_cv_summary, digits = 4,
+             caption = "Random Forest: five-fold cross-validation results")
+
+```
 
 ```{r model-improvement, eval=FALSE}
 # TODO: add tuning/feature-selection code and compare initial versus improved CV results.
