@@ -1,0 +1,2 @@
+"C","Gamma_multiplier","Weighting","Candidate","Mean_Macro_F1","SD_Macro_F1","Mean_Balanced_Accuracy","Mean_Accuracy","Total_seconds"
+1,4,"inverse",17,0.452073117871303,0.0131689202036013,0.514602066677983,0.668295935898798,40.5
