@@ -2081,6 +2081,162 @@ feature importance will be interpreted alongside correlated predictors
 and validation results; it does not establish an independent or causal
 contribution.</li>
 </ol>
+<pre class="r fold-hide"><code>library(xgboost)
+library(caret)
+library(dplyr)
+
+# 2. define Macro-F1 function
+calc_macro_f1 &lt;- function(actual, predicted, classes) {
+  f1s &lt;- sapply(classes, function(cl) {
+    tp &lt;- sum(actual == cl &amp; predicted == cl)
+    fp &lt;- sum(actual != cl &amp; predicted == cl)
+    fn &lt;- sum(actual == cl &amp; predicted != cl)
+    prec &lt;- ifelse(tp + fp == 0, 0, tp / (tp + fp))
+    rec  &lt;- ifelse(tp + fn == 0, 0, tp / (tp + fn))
+    ifelse(prec + rec == 0, 0, 2 * prec * rec / (prec + rec))
+  })
+  mean(f1s, na.rm = TRUE)
+}
+
+# 3. baseline model for 5-Fold CV
+baseline_cv_f1 &lt;- numeric(5)
+
+for (k in 1:5) {
+  # kth fold
+  fold_xtrain &lt;- cv_data[[k]]$x_train
+  fold_ytrain &lt;- cv_data[[k]]$y_train
+  fold_xvalid &lt;- cv_data[[k]]$x_valid
+  fold_yvalid &lt;- cv_data[[k]]$y_valid
+  
+  # train kth data
+  dmy &lt;- dummyVars(~ ., data = fold_xtrain, fullRank = FALSE)
+  m_train &lt;- predict(dmy, newdata = fold_xtrain)
+  m_valid &lt;- predict(dmy, newdata = fold_xvalid)
+  
+  # convert to 0-indexed labels (XGBoost)
+  lbl_train &lt;- as.integer(fold_ytrain) - 1
+  lbl_valid &lt;- as.integer(fold_yvalid) - 1
+  
+  dtrain &lt;- xgb.DMatrix(data = m_train, label = lbl_train)
+  dvalid &lt;- xgb.DMatrix(data = m_valid, label = lbl_valid)
+  
+  # Baseline 
+  base_params &lt;- list(
+    booster     = &quot;gbtree&quot;,
+    objective   = &quot;multi:softprob&quot;,
+    num_class   = n_classes,
+    eval_metric = &quot;mlogloss&quot;,
+    max_depth   = 6,
+    eta         = 0.3
+  )
+  
+  bst_base &lt;- xgb.train(
+    params  = base_params,
+    data    = dtrain,
+    nrounds = 100,
+    verbose = 0
+  )
+  
+  # predict and calculate the fold&#39;s Macro-F1
+  probs &lt;- predict(bst_base, dvalid, reshape = TRUE)
+  preds &lt;- max.col(probs) - 1
+  pred_factor &lt;- factor(outcome_levels[preds + 1], levels = outcome_levels)
+  
+  baseline_cv_f1[k] &lt;- calc_macro_f1(fold_yvalid, pred_factor, outcome_levels)
+}
+
+cat(sprintf(&quot;Baseline XGBoost 5-Fold CV Macro-F1: %.4f (± %.4f)\n&quot;, 
+            mean(baseline_cv_f1), sd(baseline_cv_f1)))</code></pre>
+<pre class="r fold-hide"><code># ==============================================================================
+# Model Improvement: Cost-Sensitive + Grid Search
+# ==============================================================================
+
+# hyperparameters
+tuning_grid &lt;- expand.grid(
+  max_depth        = c(4, 6),
+  eta              = c(0.05, 0.10),
+  subsample        = c(0.80),
+  colsample_bytree = c(0.70, 0.85),
+  min_child_weight = c(1, 3)
+)
+
+best_macro_f1 &lt;- -Inf
+best_config   &lt;- NULL
+config_results &lt;- numeric(nrow(tuning_grid))
+
+cat(sprintf(&quot;Evaluating %d th hyperparameter (5-Fold CV)...\n&quot;, nrow(tuning_grid)))
+
+for (cfg in 1:nrow(tuning_grid)) {
+  current_params &lt;- tuning_grid[cfg, ]
+  fold_f1s &lt;- numeric(5)
+  
+  for (k in 1:5) {
+    fold_xtrain &lt;- cv_data[[k]]$x_train
+    fold_ytrain &lt;- cv_data[[k]]$y_train
+    fold_xvalid &lt;- cv_data[[k]]$x_valid
+    fold_yvalid &lt;- cv_data[[k]]$y_valid
+    
+    dmy &lt;- dummyVars(~ ., data = fold_xtrain, fullRank = FALSE)
+    m_train &lt;- predict(dmy, newdata = fold_xtrain)
+    m_valid &lt;- predict(dmy, newdata = fold_xvalid)
+    
+    lbl_train &lt;- as.integer(fold_ytrain) - 1
+    lbl_valid &lt;- as.integer(fold_yvalid) - 1
+    
+    # calculate the weight of each category in each Fold
+    class_counts &lt;- table(fold_ytrain)
+    weights_per_class &lt;- nrow(fold_xtrain) / (length(class_counts) * class_counts)
+    sample_weights &lt;- as.numeric(weights_per_class[as.character(fold_ytrain)])
+    
+    dtrain &lt;- xgb.DMatrix(data = m_train, label = lbl_train, weight = sample_weights)
+    dvalid &lt;- xgb.DMatrix(data = m_valid, label = lbl_valid)
+    
+    model_params &lt;- list(
+      booster          = &quot;gbtree&quot;,
+      objective        = &quot;multi:softprob&quot;,
+      num_class        = n_classes,
+      eval_metric      = &quot;mlogloss&quot;,
+      max_depth        = current_params$max_depth,
+      eta              = current_params$eta,
+      subsample        = current_params$subsample,
+      colsample_bytree = current_params$colsample_bytree,
+      min_child_weight = current_params$min_child_weight
+    )
+    
+    bst_tuned &lt;- xgb.train(
+      params                = model_params,
+      data                  = dtrain,
+      nrounds               = 250,
+      watchlist             = list(eval = dvalid),
+      early_stopping_rounds = 20,
+      verbose               = 0
+    )
+    
+    probs &lt;- predict(bst_tuned, dvalid, reshape = TRUE)
+    preds &lt;- max.col(probs) - 1
+    pred_factor &lt;- factor(outcome_levels[preds + 1], levels = outcome_levels)
+    
+    fold_f1s[k] &lt;- calc_macro_f1(fold_yvalid, pred_factor, outcome_levels)
+  }
+  
+  mean_f1 &lt;- mean(fold_f1s)
+  config_results[cfg] &lt;- mean_f1
+  
+  if (mean_f1 &gt; best_macro_f1) {
+    best_macro_f1 &lt;- mean_f1
+    best_config   &lt;- current_params
+  }
+}
+
+# 2. result
+cat(&quot;\n=======================================================\n&quot;)
+cat(&quot;                 CV For Tuning (XGBoost)               \n&quot;)
+cat(&quot;=======================================================\n&quot;)
+cat(sprintf(&quot;Baseline CV Macro-F1  : %.4f\n&quot;, mean(baseline_cv_f1)))
+cat(sprintf(&quot;Weighted CV Macro-F1  : %.4f\n&quot;, best_macro_f1))
+cat(sprintf(&quot;Macro-F1 Difference            : +%.4f\n&quot;, best_macro_f1 - mean(baseline_cv_f1)))
+cat(&quot;\nBest Parameter:\n&quot;)
+print(best_config)</code></pre>
 </div>
 <div id="random-forest" class="section level3">
 <h3>Random Forest</h3>
