@@ -1454,7 +1454,7 @@ knitr::kable(rf_cv_summary, digits = 4,
 
 ### Cross-validated comparison
 
-```{r model-evaluation, message=FALSE, warning=FALSE, fig.width=9, fig.height=3.6, out.width="95%", fig.align='center'}
+```{r model-evaluation, message=FALSE, warning=FALSE, fig.width=9.5, fig.height=4.2, out.width="100%", fig.align='center'}
 library(dplyr)
 library(tidyr)
 library(ggplot2)
@@ -1496,16 +1496,27 @@ kable(
   caption = "Shared-fold comparison. Macro-F1 is the selection metric. Pending rows are not scored yet."
 )
 
-model_levels <- c(
-  "XGBoost (weighted + tuned)",
-  "Random Forest (selected)",
-  "RBF SVM (selected)",
-  "Multinomial logistic (glmnet M3)"
-)
-
+# Build plot data from Compared rows (include every scored model, incl. XGBoost).
+# Short axis/legend labels keep four models readable; full names stay in the table.
 cv_plot_df <- cv_compare %>%
-  filter(Status == "Compared") %>%
-  mutate(Model = factor(Model, levels = model_levels))
+  filter(Status == "Compared", !is.na(Mean_CV_Macro_F1)) %>%
+  arrange(desc(Mean_CV_Macro_F1)) %>%
+  mutate(
+    Model_full = Model,
+    Model = case_when(
+      grepl("^XGBoost", Model_full) ~ "XGBoost",
+      grepl("^Random Forest", Model_full) ~ "Random Forest",
+      grepl("^RBF SVM", Model_full) ~ "RBF SVM",
+      grepl("^Multinomial logistic", Model_full) ~ "Logistic",
+      TRUE ~ Model_full
+    ),
+    Model = factor(Model, levels = unique(Model))
+  )
+
+stopifnot(
+  any(cv_plot_df$Model == "XGBoost"),
+  nrow(cv_plot_df) >= 4
+)
 
 p_macro <- ggplot(cv_plot_df, aes(x = Model, y = Mean_CV_Macro_F1)) +
   geom_col(width = 0.62, fill = "#4C78A8") +
@@ -1517,18 +1528,29 @@ p_macro <- ggplot(cv_plot_df, aes(x = Model, y = Mean_CV_Macro_F1)) +
     width = 0.15
   ) +
   geom_text(aes(label = sprintf("%.3f", Mean_CV_Macro_F1)), vjust = -0.6, size = 3) +
+  scale_x_discrete(drop = FALSE) +
   scale_y_continuous(limits = c(0, 0.65), expand = expansion(mult = c(0, 0.08))) +
   labs(
-    title = "Primary metric: mean CV macro-F1",
+    title = "Primary metric: mean CV macro-F1 (incl. XGBoost)",
     x = NULL, y = "Macro-F1"
   ) +
   theme_minimal(base_size = 9) +
   theme(
     panel.grid.minor = element_blank(),
-    axis.text.x = element_text(angle = 22, hjust = 1)
+    axis.text.x = element_text(angle = 0, hjust = 0.5)
   )
 
+recall_levels <- levels(cv_plot_df$Model)
 recall_long <- recall_compare %>%
+  mutate(
+    Model = case_when(
+      grepl("^XGBoost", Model) ~ "XGBoost",
+      grepl("^Random Forest", Model) ~ "Random Forest",
+      grepl("^RBF SVM", Model) ~ "RBF SVM",
+      grepl("^Multinomial logistic", Model) ~ "Logistic",
+      TRUE ~ Model
+    )
+  ) %>%
   pivot_longer(
     cols = starts_with("recall_"),
     names_to = "Outcome",
@@ -1540,24 +1562,31 @@ recall_long <- recall_compare %>%
       Outcome,
       levels = c("Adoption", "Transfer", "Return", "Euthanasia", "Other")
     ),
-    Model = factor(Model, levels = model_levels)
+    Model = factor(Model, levels = recall_levels)
   )
+
+stopifnot(any(recall_long$Model == "XGBoost", na.rm = TRUE))
+
+fill_cols <- c(
+  "XGBoost" = "#4C78A8",
+  "Random Forest" = "#59A14F",
+  "RBF SVM" = "#F2A65A",
+  "Logistic" = "#B07AA1"
+)
 
 p_recall <- ggplot(recall_long, aes(x = Outcome, y = Recall, fill = Model)) +
   geom_col(position = position_dodge(width = 0.8), width = 0.75) +
   scale_y_continuous(labels = percent_format(accuracy = 1), limits = c(0, 1)) +
-  scale_fill_manual(
-    values = c("#4C78A8", "#59A14F", "#F2A65A", "#B07AA1")
-  ) +
+  scale_fill_manual(values = fill_cols, drop = FALSE) +
   labs(
-    title = "Per-class recall (stakeholder-relevant minority outcomes)",
+    title = "Per-class recall (four scored models, incl. XGBoost)",
     x = NULL, y = "Recall", fill = NULL
   ) +
   theme_minimal(base_size = 9) +
   theme(
     panel.grid.minor = element_blank(),
     legend.position = "bottom",
-    legend.text = element_text(size = 7)
+    legend.text = element_text(size = 8)
   )
 
 p_macro
