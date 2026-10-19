@@ -2595,9 +2595,8 @@ on the fold validation set; xgboost 3.x <code>evals=</code> +
 <p><strong>Selected for comparison:</strong> <code>max_depth = 6</code>,
 <code>eta = 0.1</code>, <code>colsample_bytree = 0.85</code>,
 <code>min_child_weight = 1</code>, mean OOF <code>best_nrounds</code> ≈
-184; unified OOF mean CV macro-F1 ≈ <strong>0.486</strong> (baseline
-unweighted 100-round CV ≈ 0.486 on folds, but selected weighted OOF is
-the ranking row—see <code>xgb_selected_metrics.csv</code>). Driver:
+184; unified OOF mean CV macro-F1 ≈ <strong>0.486</strong> (see
+<code>xgb_selected_metrics.csv</code>). Driver:
 <code>model_comparison/run_xgb_cv.R</code>. Foldable tuning code is in
 §5 (<code>fit-xgboost-tuned</code>); summary of the exported
 selection:</p>
@@ -3111,16 +3110,17 @@ inverse-frequency weights + extended age features)</strong>, not plain
 <tbody>
 <tr class="odd">
 <td><strong>XGBoost (weighted + tuned)</strong></td>
-<td><strong>Highest mean CV macro-F1 (0.486 ± 0.014)</strong> on the
-unified OOF pass; best balanced accuracy among non-linear models
-(~0.54); stronger Euthanasia/Other recall than RF/SVM</td>
+<td>Slightly ahead of RF on mean CV macro-F1 (<strong>0.486 ±
+0.014</strong> vs ~0.484); better minority-class recall
+(Euthanasia/Other) than RF/SVM; balanced accuracy ~0.54</td>
 <td>Slightly lower overall accuracy than RF/SVM; less directly
 interpretable than logistic coefficients</td>
 </tr>
 <tr class="even">
 <td><strong>Random Forest (selected)</strong></td>
-<td>Strong macro-F1 (~0.484); high Adoption/Transfer recall; stable
-across the Daun <code>num.trees</code>/<code>mtry</code> grid</td>
+<td>Nearly matching macro-F1 (~0.484); high Adoption/Transfer recall;
+stable across the Daun <code>num.trees</code>/<code>mtry</code>
+grid</td>
 <td>Minority recall still poor (Euthanasia ~0.08)</td>
 </tr>
 <tr class="odd">
@@ -3156,15 +3156,17 @@ via <code>run_xgb_cv.R</code>; final XGBoost holdout via
 CV-chosen hyperparameters (<code>max_depth = 6</code>,
 <code>eta = 0.1</code>, <code>subsample = 0.8</code>,
 <code>colsample_bytree = 0.85</code>, <code>min_child_weight = 1</code>;
-mean OOF <code>best_nrounds</code> = 184), because it has the highest
-mean CV macro-F1 (<strong>0.486 ± 0.014</strong>) under the
-<strong>unified</strong> ranking+recall protocol—narrowly ahead of
-Random Forest (0.484 ± 0.016)—and also improves balanced accuracy
-(~0.54) and rare-class recall relative to RF/SVM.</p>
+mean OOF <code>best_nrounds</code> = 184). Under the
+<strong>unified</strong> ranking+recall protocol it is only
+<strong>slightly ahead</strong> of Random Forest on mean CV macro-F1
+(<strong>0.486 ± 0.014</strong> vs <strong>0.484 ± 0.016</strong>), with
+<strong>better minority-class recall</strong> (Euthanasia/Other) than
+RF/SVM—not a large margin on the primary metric alone.</p>
 <p><strong>Stakeholder note.</strong> For intake triage, XGBoost’s CV
 Euthanasia recall (~0.31) and Other recall (~0.43) from the same OOF
-pass are closer to the <strong>logistic M3</strong> profile than RF/SVM,
-while still leading on the primary macro-F1 metric.</p>
+pass are closer to the <strong>logistic M3</strong> profile than RF/SVM;
+the macro-F1 edge over RF is small, so the practical case for XGBoost
+rests mainly on those rarer outcomes.</p>
 </div>
 <div id="final-holdout-evaluation-selected-xgboost" class="section level3">
 <h3>Final holdout evaluation (selected XGBoost)</h3>
@@ -3336,16 +3338,17 @@ sensitivity checks flagged leakage risk).</p>
 <div id="final-results-conclusion" class="section level2">
 <h2>8. Final Results &amp; Conclusion</h2>
 <p><strong>Final results and interpretation.</strong> Among the four
-models with exported shared-fold metrics, <strong>XGBoost</strong> leads
-on unified-OOF CV macro-F1 (<strong>0.486</strong>), with Random Forest
-close behind (~0.484). After a full-training-set refit and a single
-holdout evaluation, the selected XGBoost attains holdout macro-F1
-<strong>0.472</strong> (balanced accuracy <strong>0.517</strong>,
-accuracy <strong>0.686</strong>). Adoption and Transfer remain the
-easiest classes; Return/Euthanasia/Other stay harder. <strong>Logistic
-M3</strong> still offers useful rare-class recall and interpretability
-(holdout macro-F1 ≈ 0.441). The Decision Tree is unscored and does not
-change this four-model conclusion.</p>
+models with exported shared-fold metrics, <strong>XGBoost is only
+slightly ahead of Random Forest</strong> on unified-OOF CV macro-F1
+(<strong>0.486</strong> vs ~<strong>0.484</strong>) and shows
+<strong>better minority-class recall</strong>. After a full-training-set
+refit and a single holdout evaluation, the selected XGBoost attains
+holdout macro-F1 <strong>0.472</strong> (balanced accuracy
+<strong>0.517</strong>, accuracy <strong>0.686</strong>). Adoption and
+Transfer remain the easiest classes; Return/Euthanasia/Other stay
+harder. <strong>Logistic M3</strong> still offers useful rare-class
+recall and interpretability (holdout macro-F1 ≈ 0.441). The Decision
+Tree is unscored and does not change this four-model conclusion.</p>
 <p><strong>Answer to the research question.</strong> Intake-time
 characteristics of cats and dogs carry moderate predictive signal for
 the five consolidated outcomes: CV macro-F1 values around 0.44–0.49, and
