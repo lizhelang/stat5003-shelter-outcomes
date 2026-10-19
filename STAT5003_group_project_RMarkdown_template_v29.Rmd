@@ -62,11 +62,16 @@ Animal center accepts a variety of animals from wildlife to owned pet. Our datas
 
 **Task and relevance:** Predict the final outcome of cats and dogs—Adoption, Transfer, Return, Euthanasia, or Other—from information available at intake. This real-world task is relevant to shelters managing overcrowding and limited resources.
 
-**Stakeholders:** Shelter staff, animal-care teams, adoption and transfer coordinators, and managers allocating shelter resources.
+**Stakeholders and decisions.** Two operational roles are most directly served by intake-time predictions:
+
+1. **Intake triage officers** need a rapid risk signal in the first day after admission so they can prioritise behavioural support and veterinary attention for animals that look more likely to face prolonged stay or unfavourable outcomes (especially Euthanasia and Other).
+2. **Transfer and foster coordinators** need early outcome probabilities to start partner-rescue and foster placement before kennels fill, shortening length of stay for Transfer-prone animals.
+
+Managers allocating kennel space and staff time are secondary users of the same forecasts. The models therefore emphasise macro-F1 and per-class recall, not overall accuracy alone: majority Adoption predictions would look accurate but would not support these triage and placement decisions.
 
 **Research question:** To what extent can intake-time information of cats and dogs predict these five shelter outcomes for each animal's latest recorded admission?
 
-**Motivation:** Early predictions may help staff prioritise care, allocate resources, and identify animals at greater risk of unfavourable outcomes.
+**Motivation:** If intake characteristics carry usable signal, staff can prioritise care and placement earlier; if they do not, resources should not be steered by a misleading classifier.
 
 ## 2. Dataset & Justification
 
@@ -1201,24 +1206,169 @@ for (k in 1:5) {
 
 ## 7. Model Evaluation & Selection
 
-1.  **Data split:** Use the shared approximately 80/20 split of the latest-intake records defined above. Each animal contributes one record, and stratification uses that record's actual `Outcome.Group`. The held-out set is reserved for final model evaluation. Because the descriptive EDA used the complete selected subset, it is not entirely unseen throughout the project; acknowledge this exploratory exposure when interpreting final performance.
-2.  **Validation and preprocessing:** Compare all five models using the same outcome-stratified 5-fold cross-validation splits in `cv_folds`, with one record per animal. Each `cv_data[[k]]` contains `x_train`, `y_train`, `x_valid` and `y_valid` after common imputation, breed grouping and factor alignment based only on that fold's training rows. Each model then prepares its own encoding, scaling and any imbalance treatment using the same training rows.
-3.  **Performance metrics:** Use macro-F1 as the primary metric because the five outcomes are imbalanced. Report balanced accuracy, per-class recall, and a confusion matrix; overall accuracy will be secondary.
-4.  **Final selection:** Select the model with the strongest and most stable cross-validated macro-F1, refit it using the complete training set, and evaluate it once on the held-out test set.
+### Evaluation protocol
 
-*To complete: report the five-model comparison using shared cross-validation results, justify the selected model, and then present its held-out confusion matrix, macro-F1, balanced accuracy and per-class recall.*
+1. **Data split.** Shared stratified ~80/20 split of latest-intake records (`seed = 5003`). The 20% holdout is reserved for a single final test after model selection.
+2. **Validation.** All compared models use the same outcome-stratified 5-fold CV objects in `cv_data`, with imputation, breed grouping and factor alignment learned from each fold's training rows only.
+3. **Metrics.** **Macro-F1** is primary (unweighted mean of the five class F1 scores) because Adoption dominates the label distribution. **Balanced accuracy** is the mean of per-class recall. Overall accuracy is secondary. Metric definitions align with the SVM contribution notes: balanced accuracy here is macro-averaged recall, not mean one-vs-rest (sensitivity+specificity)/2.
+4. **Coverage note (five-model plan).** The group planned five classifiers. At the time of this comparison, **three** have exported numeric CV results under the shared split (logistic, SVM, random forest); **XGBoost** has runnable code on `branch-janet` but no exported CV summary yet; **decision tree** is still only a planned stub. Gaps are shown as pending rather than invented.
 
-```{r model-evaluation, eval=FALSE}
-# TODO: compare cross-validation results, select the final model, then evaluate it once on the held-out set.
+### Cross-validated comparison
+
+```{r model-evaluation, message=FALSE, warning=FALSE, fig.width=9, fig.height=3.6, out.width="95%", fig.align='center'}
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+library(scales)
+library(knitr)
+
+cv_compare <- read.csv(
+  "model_comparison/results/cv_comparison_summary.csv",
+  stringsAsFactors = FALSE
+)
+recall_compare <- read.csv(
+  "model_comparison/results/per_class_recall_compare.csv",
+  stringsAsFactors = FALSE
+)
+
+cv_display <- cv_compare %>%
+  transmute(
+    Model,
+    Status,
+    `Mean CV macro-F1` = ifelse(
+      is.na(Mean_CV_Macro_F1),
+      "—",
+      sprintf("%.3f ± %.3f", Mean_CV_Macro_F1, SD_CV_Macro_F1)
+    ),
+    `Mean CV balanced acc.` = ifelse(
+      is.na(Mean_CV_Balanced_Accuracy),
+      "—",
+      sprintf("%.3f", Mean_CV_Balanced_Accuracy)
+    ),
+    `Mean CV accuracy` = ifelse(
+      is.na(Mean_CV_Accuracy),
+      "—",
+      sprintf("%.3f", Mean_CV_Accuracy)
+    )
+  )
+
+kable(
+  cv_display,
+  caption = "Shared-fold comparison. Macro-F1 is the selection metric. Pending rows are not scored yet."
+)
+
+cv_plot_df <- cv_compare %>%
+  filter(Status == "Compared") %>%
+  mutate(
+    Model = factor(
+      Model,
+      levels = c(
+        "Multinomial logistic (glmnet M3)",
+        "RBF SVM (selected)",
+        "Random Forest (selected)"
+      )
+    )
+  )
+
+p_macro <- ggplot(cv_plot_df, aes(x = Model, y = Mean_CV_Macro_F1)) +
+  geom_col(width = 0.62, fill = "#4C78A8") +
+  geom_errorbar(
+    aes(
+      ymin = Mean_CV_Macro_F1 - SD_CV_Macro_F1,
+      ymax = Mean_CV_Macro_F1 + SD_CV_Macro_F1
+    ),
+    width = 0.15
+  ) +
+  geom_text(aes(label = sprintf("%.3f", Mean_CV_Macro_F1)), vjust = -0.6, size = 3) +
+  scale_y_continuous(limits = c(0, 0.6), expand = expansion(mult = c(0, 0.08))) +
+  labs(
+    title = "Primary metric: mean CV macro-F1",
+    x = NULL, y = "Macro-F1"
+  ) +
+  theme_minimal(base_size = 9) +
+  theme(
+    panel.grid.minor = element_blank(),
+    axis.text.x = element_text(angle = 18, hjust = 1)
+  )
+
+recall_long <- recall_compare %>%
+  pivot_longer(
+    cols = starts_with("recall_"),
+    names_to = "Outcome",
+    values_to = "Recall",
+    names_prefix = "recall_"
+  ) %>%
+  mutate(
+    Outcome = factor(
+      Outcome,
+      levels = c("Adoption", "Transfer", "Return", "Euthanasia", "Other")
+    ),
+    Model = factor(
+      Model,
+      levels = c(
+        "Multinomial logistic (glmnet M3)",
+        "RBF SVM (selected)",
+        "Random Forest (selected)"
+      )
+    )
+  )
+
+p_recall <- ggplot(recall_long, aes(x = Outcome, y = Recall, fill = Model)) +
+  geom_col(position = position_dodge(width = 0.75), width = 0.7) +
+  scale_y_continuous(labels = percent_format(accuracy = 1), limits = c(0, 1)) +
+  scale_fill_manual(
+    values = c("#4C78A8", "#F2A65A", "#59A14F")
+  ) +
+  labs(
+    title = "Per-class recall (stakeholder-relevant minority outcomes)",
+    x = NULL, y = "Recall", fill = NULL
+  ) +
+  theme_minimal(base_size = 9) +
+  theme(
+    panel.grid.minor = element_blank(),
+    legend.position = "bottom",
+    legend.text = element_text(size = 7)
+  )
+
+p_macro
+p_recall
 ```
+
+**How to read the metrics.** Macro-F1 rises only when precision and recall improve together across *all* five outcomes, so a model that predicts mostly Adoption can have high accuracy but low macro-F1. Balanced accuracy (mean recall) highlights whether rare Euthanasia/Other cases are found—the signal intake triage officers need. Accuracy alone is misleading here because the majority class already exceeds 50%.
+
+### Strengths and weaknesses of the compared models
+
+| Model | Strengths | Weaknesses |
+|------|-----------|------------|
+| **Multinomial logistic (M3)** | Best balanced accuracy among scored models (~0.52); strongest Euthanasia/Other/Return recall; coefficients support interpretation for staff | Lowest macro-F1 of the three (~0.441); lower Adoption/Transfer recall than tree/SVM ensembles |
+| **RBF SVM (selected)** | Competitive macro-F1 (~0.456); strong Adoption/Transfer recall; flexible non-linear boundary | Very weak Euthanasia recall (~0.05); holdout not yet scored; tuning used the same folds (optimistic for selection) |
+| **Random Forest (selected)** | **Highest mean CV macro-F1 (~0.484)**; strong majority-class performance; stable across the Daun `num.trees`/`mtry` grid | Minority recall still poor (Euthanasia ~0.08); less directly interpretable than logistic odds ratios |
+| **XGBoost** | Designed for tabular non-linear signal with class weights (Janet) | Numeric CV summary not yet merged—cannot enter the scored ranking |
+| **Decision Tree** | Planned interpretable non-linear baseline | Not uploaded—five-model plan incomplete |
+
+Artefacts live under `model_comparison/results/` (logistic and SVM copied from member branches; RF recomputed with `model_comparison/run_rf_cv.R` on the shared folds).
+
+### Final model selection
+
+**Selected model (provisional on scored CV):** **Random Forest** with `num.trees = 500` and `mtry = 4`, because it has the highest mean CV macro-F1 (0.484 ± 0.016) under the shared protocol. This matches the pre-registered selection rule in the project plan.
+
+**Stakeholder caveat.** For intake triage focused on rare unfavourable outcomes, the weighted logistic model remains a strong operational alternative: its Euthanasia recall (~0.24) and Other recall (~0.54) substantially exceed the selected RF and SVM. If the group later prioritises minority recall over macro-F1, selection should be revisited—ideally after XGBoost and the decision tree export comparable CV scores.
+
+**Holdout.** Only the logistic contribution has published a one-shot held-out test (macro-F1 ≈ 0.441, close to its CV mean). SVM and RF deliberately left `x_test`/`y_test` unused. After XGBoost and the decision tree are scored on the same folds, the selected model should be **refit once on the full training set and evaluated once on the holdout**; those holdout numbers are not reported here to avoid leaking the reserved set into an incomplete five-model bake-off.
+
+### DIP reflection and improvements
+
+**What worked.** Shared preprocessing, a single seed, and common `cv_data` folds made member contributions comparable without re-splitting. Primary use of macro-F1 (with balanced accuracy and per-class recall) matched the imbalanced multi-class problem and stakeholder needs better than accuracy.
+
+**What to improve next time.** (1) Freeze a results schema early so every model exports the same CV summary and OOF predictions before report writing. (2) Keep a true outer holdout unused until *all* planned models finish tuning. (3) Document class-weight tradeoffs in one place—weighted fits help triage officers but can lower accuracy/macro-F1. (4) Complete the fifth model (decision tree) and merge Janet's XGBoost CV numbers so selection is not provisional. (5) Revisit whether `Spayed.Neutered` is fully available at intake (logistic sensitivity checks flagged leakage risk).
 
 ## 8. Final Results & Conclusion
 
-**Final results and interpretation.** *To complete: summarise the selected model's performance, which outcomes were predicted well or poorly, and the practical meaning of these results.*
+**Final results and interpretation.** Among the three models with exported shared-fold metrics, Random Forest currently leads on CV macro-F1 (~0.48). Adoption and Transfer are predicted reasonably well by RF and SVM; Return, Euthanasia and Other remain difficult. The logistic model, while slightly behind on macro-F1, recovers more of the rare outcomes that matter for triage. XGBoost and the decision tree are still outstanding before a definitive group selection.
 
-**Answer to the research question.** *To complete: explain how well the available animal characteristics predict the five shelter outcomes, using the final results as evidence.*
+**Answer to the research question.** Intake-time characteristics of cats and dogs carry moderate predictive signal for the five consolidated outcomes: CV macro-F1 values around 0.44–0.48 clearly beat a majority-class baseline (~0.14) but leave substantial error on minority classes. Predictions can support prioritisation, not autonomous outcome determination.
 
-**Limitations and future work.** *To complete: discuss the availability of predictors at intake, class imbalance, recording quality, exploratory exposure of the full dataset, the restriction to each animal's latest recorded admission, and the limits of generalising to other periods or shelters.*
+**Limitations and future work.** Predictors may not all be known at true intake; labels are imbalanced; EDA saw the full selected subset before modelling; analysis uses each animal's latest admission only; and results may not generalise to other shelters or periods. Next steps are to finish XGBoost and decision-tree CV exports, then run a single holdout evaluation of the final chosen model.
 
 ## References
 

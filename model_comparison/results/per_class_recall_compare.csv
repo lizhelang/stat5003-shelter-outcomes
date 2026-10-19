@@ -1,0 +1,4 @@
+Model,Metric_basis,recall_Adoption,recall_Transfer,recall_Return,recall_Euthanasia,recall_Other
+Multinomial logistic (glmnet M3),5-fold CV mean,0.7549,0.4680,0.6029,0.2448,0.5367
+RBF SVM (selected),Pooled OOF,0.9770,0.8364,0.2121,0.0460,0.1283
+Random Forest (selected),Pooled OOF,0.9698,0.8237,0.2648,0.0773,0.1728

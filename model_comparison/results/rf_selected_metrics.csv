@@ -1,0 +1,2 @@
+"Model","Macro_F1_pooled_oof","Balanced_Accuracy_pooled_oof","Accuracy_pooled_oof","Mean_CV_Macro_F1","SD_CV_Macro_F1","Mean_CV_Balanced_Accuracy","num.trees","mtry"
+"Random Forest (CV-selected)",0.483881383871358,0.461675054770728,0.799658424296428,0.4836320237441,0.0155415665043028,0.461689358990627,500,4
