@@ -6,24 +6,17 @@ Shared evaluation inputs for Section 7 of the main report.
 
 | Model | Artefact |
 |------|----------|
-| Multinomial logistic (Zilan) | Copied from `origin/zilan` → `zilan/results/` |
-| RBF SVM (Jackson) | Copied from `origin/Jackson_SVM` → `SVM_week12/svm_results/` |
-| Random Forest (Daun grid) | Recomputed here with `run_rf_cv.R` on the shared v29 folds (`seed = 5003`) |
-| XGBoost (Janet) | Code on `branch-janet`; numeric CV summary not yet exported |
+| Multinomial logistic (Zilan) | `zilan/results/` (EDA association plots removed on integration branch) |
+| RBF SVM (Jackson) | `SVM_week12/svm_results/` |
+| Random Forest (Daun grid) | `run_rf_cv.R` on shared v29 folds (`seed = 5003`) |
+| XGBoost (Janet design) | `run_xgb_cv.R` — weighted + tuned grid on the same folds |
 | Decision Tree | Planned; not uploaded |
 
-## Reproduce RF CV metrics
-
-From the repository root (requires `dplyr`, `caret`, `ranger`, `lubridate`, …):
+## Reproduce
 
 ```r
 source("model_comparison/run_rf_cv.R")
-```
-
-## Knit the report
-
-Open `STAT5003_group_project_RMarkdown_template_v29.Rmd` in RStudio and Knit to HTML, or:
-
-```r
+# requires xgboost in .libPaths():
+source("model_comparison/run_xgb_cv.R")
 rmarkdown::render("STAT5003_group_project_RMarkdown_template_v29.Rmd")
 ```

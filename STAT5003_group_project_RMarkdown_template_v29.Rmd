@@ -3,7 +3,9 @@ title: "Predicting Shelter Outcomes"
 author: "W01G04"
 output:
   html_document:
-    code_folding: hide 
+    code_folding: hide
+    theme: default
+    self_contained: true
 ---
 
 <style>
@@ -40,6 +42,17 @@ ul, ol { margin-top: 2px; margin-bottom: 6px; }
 li > p { margin-bottom: 2px; }
 table { margin-top: 4px; margin-bottom: 6px; }
 
+/*
+ * Keep R source collapsed by default.
+ * Bootstrap's .collapse { display:none } can fail in some HTML preview hosts;
+ * this CSS fallback matches rmarkdown code_folding: hide.
+ */
+div.r-code-collapse:not(.show):not(.in) {
+  display: none !important;
+  height: 0 !important;
+  overflow: hidden !important;
+}
+
 @media print {
   @page { size: Letter; margin: 12mm; }
   body {
@@ -55,6 +68,11 @@ table { margin-top: 4px; margin-bottom: 6px; }
   }
 }
 </style>
+
+```{r setup-code-folding, include=FALSE}
+# Default: hide source chunks (complements YAML code_folding: hide).
+knitr::opts_chunk$set(class.source = "fold-hide")
+```
 
 ## 1. Problem Framing & Research Question
 
@@ -1148,22 +1166,43 @@ for (k in 1:5) {
 
 ### Random Forest
 
-1.  **Purpose and justification:** Random Forest is a non-linear ensemble model and it is suitable for classification. By averaging many decision trees built from bootstrap samples and random subsets of predictors, Random Forest can reduce the variance and overfitting of a single decision tree.
-2.  **Predictors and preprocessing:** We will use the same predictor set as the Multinomial Logistic Regression model. Categorical predictors will be one-hot encoded where required by the implementation. `Age_Years_imputed` will remain on its original scale as in Gradient Boosting because it is also tree-based model.
-3.  **Class imbalance:** We will apply class weighting so that rare outcomes, particularly Euthanasia and Other, receive greater influence during model training rather than being dominated by the majority Adoption class.
-4.  **Evaluation:** Follow the shared outcome-stratified cross-validation plan, using macro-F1 as the primary metric together with balanced accuracy, per-class recall, and a confusion matrix. Feature importance will also be examined to identify which animal characteristics contribute most to prediction and to compare with the XGBoost importance ranking.
+Random Forest combines many decision trees to capture non-linear relationships and reduce the variance of a single tree. We use the same eight predictors as the other models, keeping categorical variables as factors and age on its original scale.
 
+**Baseline model.** We first fit a Random Forest with default settings: 500 trees and two randomly selected predictors at each split. No class weights are applied. Performance is assessed using macro-F1, balanced accuracy (mean class recall), and overall accuracy.
 ```{r fit-random-forest, eval=FALSE}
-# CV inputs: cv_data[[k]]$x_train, $y_train, $x_valid and $y_valid.
-# Final refit: x_train, y_train. Final evaluation: x_test, y_test.
-# Additional preprocessing 11: use the common factor data if the chosen package
-# supports factors. Otherwise, encode here using training levels and align
-# validation/test columns; remove training-constant inputs if required.
-# If encoding is needed, name the copies x_train_encoded and x_test_encoded.
-# Additional preprocessing 12: leave age unscaled. Calculate any class weights
-# from this training part's outcome frequencies only.
-# Use y_train/y_test as the response; x_train/x_test contain predictors only.
-# TODO: fit Random Forest and retain out-of-fold predictions.
+library(ranger)
+
+# Train the baseline model using default settings.
+rf_baseline <- ranger(x = x_train, y = y_train, seed = 5003)
+
+# Predict the test outcomes.
+rf_baseline_pred <- predict(rf_baseline, data = x_test)$predictions
+
+# Calculate recall and F1 for each outcome by counting observations.
+rf_baseline_recall <- c()
+rf_baseline_f1 <- c()
+
+for (class in levels(y_test)) {
+  # Number of animals actually in this class.
+  actual_count <- sum(y_test == class)
+
+  # Number of animals predicted to be in this class.
+  predicted_count <- sum(rf_baseline_pred == class)
+
+  # Number correctly predicted to be in this class.
+  correct_count <- sum(y_test == class & rf_baseline_pred == class)
+
+  rf_baseline_recall[class] <- correct_count / actual_count
+  rf_baseline_f1[class] <- 2 * correct_count / (actual_count + predicted_count)
+}
+
+rf_baseline_results <- data.frame(
+  Model = "Baseline RF",
+  Macro_F1 = mean(rf_baseline_f1),
+  Balanced_Accuracy = mean(rf_baseline_recall),
+  Accuracy = mean(rf_baseline_pred == y_test)
+)
+knitr::kable(rf_baseline_results, digits = 4)
 ```
 
 ### Support Vector Machine (SVM)
@@ -1196,7 +1235,51 @@ for (k in 1:5) {
 
 ### Improvement Results
 
+#### Random Forest: hyperparameter tuning
 
+We tune the number of trees (`num.trees`: 100, 300, 500) and the number of predictors considered at each split (`mtry`: 2, 4, 8). All other settings remain at their defaults. Each combination is evaluated using the shared five-fold cross-validation data, and the combination with the highest mean macro-F1 is selected. Test results are not used to choose the parameters.
+```{r rf-tuning, eval=FALSE}
+rf_grid <- expand.grid(num.trees = c(100, 300, 500), mtry = c(2, 4, 8))
+rf_cv_results <- data.frame()
+
+# Try each parameter combination on the same five folds.
+for (i in 1:nrow(rf_grid)) {
+  for (k in seq_along(cv_data)) {
+    fold <- cv_data[[k]]
+    rf_model <- ranger(
+      x = fold$x_train, y = fold$y_train,
+      num.trees = rf_grid$num.trees[i],
+      mtry = rf_grid$mtry[i], seed = 5003 + k
+    )
+    preds <- predict(rf_model, data = fold$x_valid)$predictions
+    # Calculate F1 for each outcome in this validation fold.
+    rf_fold_f1 <- c()
+    for (class in levels(fold$y_valid)) {
+      actual_count <- sum(fold$y_valid == class)
+      predicted_count <- sum(preds == class)
+      correct_count <- sum(fold$y_valid == class & preds == class)
+
+      rf_fold_f1[class] <- 2 * correct_count / (actual_count + predicted_count)
+    }
+
+    rf_cv_results <- rbind(rf_cv_results, data.frame(
+      num.trees = rf_grid$num.trees[i], mtry = rf_grid$mtry[i],
+      Fold = k, Macro_F1 = mean(rf_fold_f1)
+    ))
+  }
+}
+
+# Average the validation scores and select the best combination.
+rf_cv_summary <- rf_cv_results %>%
+  group_by(num.trees, mtry) %>%
+  summarise(Mean_Macro_F1 = mean(Macro_F1),
+            SD_Macro_F1 = sd(Macro_F1), .groups = "drop")
+rf_best <- rf_cv_summary[which.max(rf_cv_summary$Mean_Macro_F1), ]
+rf_baseline_cv <- rf_cv_summary %>% filter(num.trees == 500, mtry == 2)
+knitr::kable(rf_cv_summary, digits = 4,
+             caption = "Random Forest: five-fold cross-validation results")
+
+```
 
 ```{r model-improvement, eval=FALSE}
 # TODO: add tuning/feature-selection code and compare initial versus improved CV results.
@@ -1211,7 +1294,7 @@ for (k in 1:5) {
 1. **Data split.** Shared stratified ~80/20 split of latest-intake records (`seed = 5003`). The 20% holdout is reserved for a single final test after model selection.
 2. **Validation.** All compared models use the same outcome-stratified 5-fold CV objects in `cv_data`, with imputation, breed grouping and factor alignment learned from each fold's training rows only.
 3. **Metrics.** **Macro-F1** is primary (unweighted mean of the five class F1 scores) because Adoption dominates the label distribution. **Balanced accuracy** is the mean of per-class recall. Overall accuracy is secondary. Metric definitions align with the SVM contribution notes: balanced accuracy here is macro-averaged recall, not mean one-vs-rest (sensitivity+specificity)/2.
-4. **Coverage note (five-model plan).** The group planned five classifiers. At the time of this comparison, **three** have exported numeric CV results under the shared split (logistic, SVM, random forest); **XGBoost** has runnable code on `branch-janet` but no exported CV summary yet; **decision tree** is still only a planned stub. Gaps are shown as pending rather than invented.
+4. **Coverage note (five-model plan).** The group planned five classifiers. **Four** now have exported numeric CV results under the shared split (XGBoost, random forest, SVM, logistic). **Decision tree** is still only a planned stub and is shown as not uploaded rather than invented.
 
 ### Cross-validated comparison
 
@@ -1257,18 +1340,16 @@ kable(
   caption = "Shared-fold comparison. Macro-F1 is the selection metric. Pending rows are not scored yet."
 )
 
+model_levels <- c(
+  "XGBoost (weighted + tuned)",
+  "Random Forest (selected)",
+  "RBF SVM (selected)",
+  "Multinomial logistic (glmnet M3)"
+)
+
 cv_plot_df <- cv_compare %>%
   filter(Status == "Compared") %>%
-  mutate(
-    Model = factor(
-      Model,
-      levels = c(
-        "Multinomial logistic (glmnet M3)",
-        "RBF SVM (selected)",
-        "Random Forest (selected)"
-      )
-    )
-  )
+  mutate(Model = factor(Model, levels = model_levels))
 
 p_macro <- ggplot(cv_plot_df, aes(x = Model, y = Mean_CV_Macro_F1)) +
   geom_col(width = 0.62, fill = "#4C78A8") +
@@ -1280,7 +1361,7 @@ p_macro <- ggplot(cv_plot_df, aes(x = Model, y = Mean_CV_Macro_F1)) +
     width = 0.15
   ) +
   geom_text(aes(label = sprintf("%.3f", Mean_CV_Macro_F1)), vjust = -0.6, size = 3) +
-  scale_y_continuous(limits = c(0, 0.6), expand = expansion(mult = c(0, 0.08))) +
+  scale_y_continuous(limits = c(0, 0.65), expand = expansion(mult = c(0, 0.08))) +
   labs(
     title = "Primary metric: mean CV macro-F1",
     x = NULL, y = "Macro-F1"
@@ -1288,7 +1369,7 @@ p_macro <- ggplot(cv_plot_df, aes(x = Model, y = Mean_CV_Macro_F1)) +
   theme_minimal(base_size = 9) +
   theme(
     panel.grid.minor = element_blank(),
-    axis.text.x = element_text(angle = 18, hjust = 1)
+    axis.text.x = element_text(angle = 22, hjust = 1)
   )
 
 recall_long <- recall_compare %>%
@@ -1303,21 +1384,14 @@ recall_long <- recall_compare %>%
       Outcome,
       levels = c("Adoption", "Transfer", "Return", "Euthanasia", "Other")
     ),
-    Model = factor(
-      Model,
-      levels = c(
-        "Multinomial logistic (glmnet M3)",
-        "RBF SVM (selected)",
-        "Random Forest (selected)"
-      )
-    )
+    Model = factor(Model, levels = model_levels)
   )
 
 p_recall <- ggplot(recall_long, aes(x = Outcome, y = Recall, fill = Model)) +
-  geom_col(position = position_dodge(width = 0.75), width = 0.7) +
+  geom_col(position = position_dodge(width = 0.8), width = 0.75) +
   scale_y_continuous(labels = percent_format(accuracy = 1), limits = c(0, 1)) +
   scale_fill_manual(
-    values = c("#4C78A8", "#F2A65A", "#59A14F")
+    values = c("#4C78A8", "#59A14F", "#F2A65A", "#B07AA1")
   ) +
   labs(
     title = "Per-class recall (stakeholder-relevant minority outcomes)",
@@ -1340,35 +1414,35 @@ p_recall
 
 | Model | Strengths | Weaknesses |
 |------|-----------|------------|
-| **Multinomial logistic (M3)** | Best balanced accuracy among scored models (~0.52); strongest Euthanasia/Other/Return recall; coefficients support interpretation for staff | Lowest macro-F1 of the three (~0.441); lower Adoption/Transfer recall than tree/SVM ensembles |
-| **RBF SVM (selected)** | Competitive macro-F1 (~0.456); strong Adoption/Transfer recall; flexible non-linear boundary | Very weak Euthanasia recall (~0.05); holdout not yet scored; tuning used the same folds (optimistic for selection) |
-| **Random Forest (selected)** | **Highest mean CV macro-F1 (~0.484)**; strong majority-class performance; stable across the Daun `num.trees`/`mtry` grid | Minority recall still poor (Euthanasia ~0.08); less directly interpretable than logistic odds ratios |
-| **XGBoost** | Designed for tabular non-linear signal with class weights (Janet) | Numeric CV summary not yet merged—cannot enter the scored ranking |
+| **XGBoost (weighted + tuned)** | **Highest mean CV macro-F1 (~0.489)**; best balanced accuracy among non-linear models (~0.54); stronger Euthanasia/Other recall than RF/SVM | Slightly lower overall accuracy than RF/SVM; less directly interpretable than logistic coefficients |
+| **Random Forest (selected)** | Strong macro-F1 (~0.484); high Adoption/Transfer recall; stable across the Daun `num.trees`/`mtry` grid | Minority recall still poor (Euthanasia ~0.08) |
+| **RBF SVM (selected)** | Competitive macro-F1 (~0.456); strong Adoption/Transfer recall | Very weak Euthanasia recall (~0.05); holdout unused |
+| **Multinomial logistic (M3)** | Strong Return/Other recall; interpretable odds ratios; published holdout close to CV | Lowest macro-F1 (~0.441) among the four scored models |
 | **Decision Tree** | Planned interpretable non-linear baseline | Not uploaded—five-model plan incomplete |
 
-Artefacts live under `model_comparison/results/` (logistic and SVM copied from member branches; RF recomputed with `model_comparison/run_rf_cv.R` on the shared folds).
+Artefacts live under `model_comparison/results/` (logistic from `zilan/`; SVM from `SVM_week12/`; RF via `run_rf_cv.R`; XGBoost via `run_xgb_cv.R` using Janet's weighting/tuning design on the shared folds).
 
 ### Final model selection
 
-**Selected model (provisional on scored CV):** **Random Forest** with `num.trees = 500` and `mtry = 4`, because it has the highest mean CV macro-F1 (0.484 ± 0.016) under the shared protocol. This matches the pre-registered selection rule in the project plan.
+**Selected model (on scored CV):** **XGBoost** with inverse-frequency class weights and CV-chosen hyperparameters (`max_depth = 6`, `eta = 0.1`, `subsample = 0.8`, `colsample_bytree = 0.85`, `min_child_weight = 1`), because it has the highest mean CV macro-F1 (**0.489 ± 0.014**) under the shared protocol—narrowly ahead of Random Forest (0.484 ± 0.016)—and also improves balanced accuracy (~0.54) and rare-class recall relative to RF/SVM.
 
-**Stakeholder caveat.** For intake triage focused on rare unfavourable outcomes, the weighted logistic model remains a strong operational alternative: its Euthanasia recall (~0.24) and Other recall (~0.54) substantially exceed the selected RF and SVM. If the group later prioritises minority recall over macro-F1, selection should be revisited—ideally after XGBoost and the decision tree export comparable CV scores.
+**Stakeholder note.** For intake triage, XGBoost's Euthanasia recall (~0.30) and Other recall (~0.46) are closer to the weighted logistic profile than RF/SVM, while still leading on the primary macro-F1 metric. The decision tree remains outstanding before a fully five-model bake-off.
 
-**Holdout.** Only the logistic contribution has published a one-shot held-out test (macro-F1 ≈ 0.441, close to its CV mean). SVM and RF deliberately left `x_test`/`y_test` unused. After XGBoost and the decision tree are scored on the same folds, the selected model should be **refit once on the full training set and evaluated once on the holdout**; those holdout numbers are not reported here to avoid leaking the reserved set into an incomplete five-model bake-off.
+**Holdout.** Only the logistic contribution has published a one-shot held-out test (macro-F1 ≈ 0.441). SVM, RF and XGBoost left `x_test`/`y_test` unused during tuning. After the decision tree is scored—or if the group freezes the four-model set—the selected model should be **refit once on the full training set and evaluated once on the holdout**.
 
 ### DIP reflection and improvements
 
-**What worked.** Shared preprocessing, a single seed, and common `cv_data` folds made member contributions comparable without re-splitting. Primary use of macro-F1 (with balanced accuracy and per-class recall) matched the imbalanced multi-class problem and stakeholder needs better than accuracy.
+**What worked.** Shared preprocessing, a single seed, and common `cv_data` folds made member contributions comparable without re-splitting. Exporting a common CV summary schema (`model_comparison/results/`) let XGBoost, RF, SVM and logistic enter the same table. Primary use of macro-F1 with balanced accuracy and per-class recall matched the imbalanced multi-class problem and stakeholder needs better than accuracy.
 
-**What to improve next time.** (1) Freeze a results schema early so every model exports the same CV summary and OOF predictions before report writing. (2) Keep a true outer holdout unused until *all* planned models finish tuning. (3) Document class-weight tradeoffs in one place—weighted fits help triage officers but can lower accuracy/macro-F1. (4) Complete the fifth model (decision tree) and merge Janet's XGBoost CV numbers so selection is not provisional. (5) Revisit whether `Spayed.Neutered` is fully available at intake (logistic sensitivity checks flagged leakage risk).
+**What to improve next time.** (1) Freeze the results schema before members finish tuning. (2) Keep the outer holdout unused until *all* planned models finish. (3) Document class-weight tradeoffs in one place. (4) Complete the fifth model (decision tree). (5) Revisit whether `Spayed.Neutered` is fully available at intake (logistic sensitivity checks flagged leakage risk).
 
 ## 8. Final Results & Conclusion
 
-**Final results and interpretation.** Among the three models with exported shared-fold metrics, Random Forest currently leads on CV macro-F1 (~0.48). Adoption and Transfer are predicted reasonably well by RF and SVM; Return, Euthanasia and Other remain difficult. The logistic model, while slightly behind on macro-F1, recovers more of the rare outcomes that matter for triage. XGBoost and the decision tree are still outstanding before a definitive group selection.
+**Final results and interpretation.** Among the four models with exported shared-fold metrics, **XGBoost** leads on CV macro-F1 (~0.489), with Random Forest close behind (~0.484). Adoption and Transfer are predicted well by the tree ensembles and SVM; XGBoost and weighted logistic recover more of the rare Euthanasia/Other cases that matter for triage. The decision tree is still outstanding.
 
-**Answer to the research question.** Intake-time characteristics of cats and dogs carry moderate predictive signal for the five consolidated outcomes: CV macro-F1 values around 0.44–0.48 clearly beat a majority-class baseline (~0.14) but leave substantial error on minority classes. Predictions can support prioritisation, not autonomous outcome determination.
+**Answer to the research question.** Intake-time characteristics of cats and dogs carry moderate predictive signal for the five consolidated outcomes: CV macro-F1 values around 0.44–0.49 clearly beat a majority-class baseline (~0.14) but leave substantial error on minority classes. Predictions can support prioritisation, not autonomous outcome determination.
 
-**Limitations and future work.** Predictors may not all be known at true intake; labels are imbalanced; EDA saw the full selected subset before modelling; analysis uses each animal's latest admission only; and results may not generalise to other shelters or periods. Next steps are to finish XGBoost and decision-tree CV exports, then run a single holdout evaluation of the final chosen model.
+**Limitations and future work.** Predictors may not all be known at true intake; labels are imbalanced; EDA saw the full selected subset before modelling; analysis uses each animal's latest admission only; and results may not generalise to other shelters or periods. Next steps are to finish the decision-tree CV export, then run a single holdout evaluation of the final chosen model.
 
 ## References
 

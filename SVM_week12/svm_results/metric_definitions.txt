@@ -1,0 +1,7 @@
+Balanced_Accuracy is macro-averaged class recall (mean sensitivity), not mean one-vs-rest (sensitivity+specificity)/2.
+Mean_Macro_F1 is the unweighted mean of the five fold macro-F1 values; SD is their sample standard deviation.
+Pooled OOF metrics pool all held-out fold predictions and need not equal the fold means.
+The selected configuration maximises mean CV macro-F1 across 18 candidates (90 fits).
+The same CV folds were used for tuning and reporting; selected CV scores are optimistic development estimates, not an independent final performance estimate.
+No x_test or y_test was used in tuning, selection or model fitting. Only score the holdout after the group selects its final model.
+The final saved SVM was refit using full training data; its encoder and class weights were learned again from full training only.

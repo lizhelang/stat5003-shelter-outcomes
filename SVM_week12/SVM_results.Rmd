@@ -1,0 +1,98 @@
+---
+title: "SVM: Predicting Shelter Outcomes"
+author: "STAT5003 W01G04 — SVM contribution"
+output:
+  html_document:
+    code_folding: hide
+    toc: true
+---
+
+```{r svm-report-inputs, include=FALSE}
+knitr::opts_chunk$set(message = FALSE, warning = FALSE)
+comparison <- read.csv("svm_results/baseline_vs_selected.csv")
+tuning <- read.csv("svm_results/tuning_summary.csv")
+per_class <- read.csv("svm_results/oof_per_class.csv")
+pooled <- read.csv("svm_results/oof_pooled_metrics.csv")
+audit <- read.csv("svm_results/data_audit.csv")
+tradeoff <- read.csv("svm_results/weighting_tradeoff.csv")
+weighted <- read.csv("svm_results/best_weighted_cv.csv")
+best <- tuning[1, ]
+baseline <- comparison[comparison$Model == "SVM baseline", ]
+delta <- best$Mean_Macro_F1 - baseline$Mean_Macro_F1
+best_class <- per_class$Class[which.max(per_class$Recall)]
+worst_class <- per_class$Class[which.min(per_class$Recall)]
+pct <- function(x) sprintf("%.1f%%", 100 * x)
+recall_for <- function(class) per_class$Recall[per_class$Class == class]
+```
+
+## Model implementation
+
+We fitted a radial-basis-function support vector machine using `e1071::svm()` with one-versus-one multiclass classification. The eight predictors were `Type`, `Sex`, `Spayed.Neutered`, `primary.breed.group`, `Base_Color`, `has_pattern`, `has_Name`, and `Age_Years_imputed`. Each animal contributed its latest recorded intake only. We used the shared outcome-stratified split and five cross-validation folds (seed 5003) from the group's v29 report.
+
+Within each fold, the common preprocessing estimated species-specific median ages and the eight most frequent breeds from that fold's training data. The SVM then fitted a full one-hot encoder, removed training-constant columns, and standardised age using the training mean and standard deviation. Binary indicators remained 0/1. Internal SVM scaling was disabled to avoid scaling the same inputs twice. Assessment-only categories were represented by an all-zero block, preserving row alignment. No encoding or scaling parameters were learned from validation data.
+
+```{r svm-sample-summary}
+knitr::kable(audit, caption = "Data and common split from the GitHub v29 snapshot")
+```
+
+## Model improvement
+
+The baseline used `C = 1`, `gamma = 1/p`, and no class weights, where `p` is the number of retained encoded predictors. A grid compared `C` in {0.1, 1, 10}, gamma multipliers in {0.25, 1, 4} applied to `1/p`, and unweighted versus inverse-frequency-weighted training: 18 configurations and 90 fold fits. Inverse weights were calculated from the current training partition as `n / (K * n_class)`, so their mean per observation was one. We selected the configuration with the highest mean fold macro-F1, breaking ties by lower fold standard deviation and then lower cost and gamma multiplier.
+
+The selected configuration was **C = `r best$C`, gamma = `r best$Gamma_multiplier`/p, weighting = `r best$Weighting`**. Its mean CV macro-F1 was **`r sprintf("%.3f", best$Mean_Macro_F1)`**, compared with **`r sprintf("%.3f", baseline$Mean_Macro_F1)`** for the baseline, a change of **`r sprintf("%+.3f", delta)`**.
+
+```{r svm-baseline-comparison}
+knitr::kable(comparison[c("Model", "C", "Gamma_multiplier", "Weighting",
+                          "Mean_Macro_F1", "SD_Macro_F1",
+                          "Mean_Balanced_Accuracy", "Mean_Accuracy")],
+              digits = 3, caption = "SVM baseline versus selected configuration: shared five-fold CV")
+```
+
+```{r svm-tuning-figure, echo=FALSE, out.width="100%"}
+knitr::include_graphics("svm_results/svm_tuning.png")
+```
+
+## Evaluation and interpretation
+
+Balanced accuracy is defined here as the unweighted mean of the five class recalls. It is **not** the average of one-versus-rest sensitivity and specificity. The main comparison table reports the mean of the five fold metrics, with the sample standard deviation of macro-F1. Pooling all out-of-fold predictions gives a macro-F1 of **`r sprintf("%.3f", pooled$Macro_F1)`**, balanced accuracy of **`r pct(pooled$Balanced_Accuracy)`**, and accuracy of **`r pct(pooled$Accuracy)`**. Pooled metrics need not equal fold means.
+
+```{r svm-class-metrics}
+knitr::kable(per_class, digits = 3, caption = "Selected SVM: pooled out-of-fold class metrics")
+```
+
+The highest recall was observed for **`r best_class`**, and the lowest for **`r worst_class`**. The confusion matrix shows where the model redirected missed cases; these class-specific errors should inform the group's comparison, rather than relying on overall accuracy alone. The model estimates associations in recorded data, and its predictions should support human review rather than determine an individual animal's treatment.
+
+In particular, recall was **`r pct(recall_for('Adoption'))` for Adoption**, **`r pct(recall_for('Transfer'))` for Transfer**, but only **`r pct(recall_for('Euthanasia'))` for Euthanasia** and **`r pct(recall_for('Other'))` for Other**. The model therefore misses most actual Euthanasia cases despite its relatively high overall accuracy. It is not a reliable stand-alone detector of high-risk animals under this configuration.
+
+The best inverse-weighted configuration had mean CV macro-F1 **`r sprintf('%.3f', weighted$Mean_Macro_F1)`**, versus **`r sprintf('%.3f', best$Mean_Macro_F1)`** for the selected model. The table below shows its different precision/recall tradeoff. A small difference in mean macro-F1 does not establish superiority; if the shelter prioritises identifying rare outcomes, the group should agree on that objective using training/CV evidence before final selection and holdout scoring.
+
+```{r svm-weighting-tradeoff}
+knitr::kable(tradeoff[tradeoff$Class %in% c('Return', 'Euthanasia', 'Other'),
+                       c('Variant', 'Class', 'Precision', 'Recall', 'F1')],
+              digits = 3, caption = "Rare-outcome tradeoff: selected versus best weighted SVM (pooled OOF)")
+```
+
+```{r svm-confusion-figure, echo=FALSE, out.width="85%"}
+knitr::include_graphics("svm_results/svm_confusion_matrix.png")
+```
+
+**Scope of the evidence.** These CV folds were used both to tune and to report the selected configuration, so its CV performance is an optimistic development estimate. Differences between candidates or between models should not be described as statistically significant without additional analysis. The group should compare all five models under the same metric definitions, select its final model, and only then score the reserved holdout. This contribution has not evaluated that holdout and does not claim SVM is the best of the five models.
+
+The full dataset was inspected during EDA, so the holdout was not completely isolated from exploratory decisions. Intake-time availability of `Name` and `Spayed.Neutered` is also unverified; results should not yet be described as proven prospective intake predictions. The latest-admission sample and this shelter's recording practices limit generalisation to future admissions and other shelters.
+
+## Reproducible implementation
+
+Run `run_svm.R` from this folder to rebuild the common v29 preprocessing and SVM results. It reads the repository dataset, not the older A1/local CSV. `svm_results/` contains the full grid, fold scores, row-aligned out-of-fold predictions, plots, sample/split audits, session information, and the training-only SVM refit.
+
+The code below is the exact SVM implementation used for this contribution. It starts from the group's `cv_data`, `cv_folds`, `x_train` and `y_train` objects.
+
+```{r svm-implementation, eval=FALSE, code=readLines("svm_model.R")}
+```
+
+## References and AI assistance
+
+Chang, C.-C., & Lin, C.-J. (2011). LIBSVM: A library for support vector machines. *ACM Transactions on Intelligent Systems and Technology, 2*(3), Article 27. <https://doi.org/10.1145/1961189.1961199>
+
+Implementation documentation: [CRAN e1071 manual](https://cran.r-project.org/web/packages/e1071/refman/e1071.html).
+
+OpenAI Codex assisted with developing the SVM code, running checks, and drafting interpretations. The model owner should review the code, metrics, and wording and reconcile this statement with the group's AI-use disclosure before submission.
