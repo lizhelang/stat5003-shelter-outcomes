@@ -1522,8 +1522,8 @@ knitr::kable(rf_cv_summary, digits = 4,
 1. **Data split.** Shared stratified ~80/20 split of latest-intake records (`seed = 5003`). The 20% holdout is reserved for a single final test after model selection.
 2. **Validation.** All compared models use the same outcome-stratified 5-fold CV objects in `cv_data`, with imputation, breed grouping and factor alignment learned from each fold's training rows only.
 3. **Metrics.** **Macro-F1** is primary (unweighted mean of the five class F1 scores) because Adoption dominates the label distribution. **Balanced accuracy** is the mean of per-class recall. Overall accuracy is secondary. Metric definitions align with the SVM contribution notes: balanced accuracy here is macro-averaged recall, not mean one-vs-rest (sensitivity+specificity)/2.
-4. **Coverage note (five-model plan).** The group planned five classifiers. **Four** now have exported numeric CV results under the shared split (XGBoost, random forest, SVM, logistic **M3**). **Decision tree** is still only a planned stub and is shown as not uploaded rather than invented.
-5. **XGBoost protocol.** Ranking macro-F1 and per-class recall for XGBoost are from the **same** OOF pass under early stopping (max 250 rounds, stop after 20 non-improving rounds; `attr(bst,"early_stop")$best_iteration`). They are not mixed with a fixed-100-round export.
+4. **Coverage note (five-model plan).** The group planned five classifiers. **Four** have exported numeric CV results under the shared split (XGBoost, random forest, SVM, logistic **M3**). **Decision tree** is still unscored; that gap does **not** block final evaluation of the selected model among the four completed models. Earlier “wait for the tree / freeze the set” wording was a sequencing choice, not a technical blocker.
+5. **XGBoost protocol.** Ranking macro-F1 and per-class recall for XGBoost are from the **same** OOF pass under early stopping (max 250 rounds, stop after 20 non-improving rounds; `attr(bst,"early_stop")$best_iteration`). After selection, the chosen configuration is **refit once on full `x_train`/`y_train`** with `nrounds` frozen at the mean OOF `best_iteration` (184), then scored **once** on untouched `x_test`/`y_test` (`model_comparison/run_xgb_holdout.R`). The holdout is never used for early stopping or tuning.
 
 ### Cross-validated comparison
 
@@ -1680,33 +1680,84 @@ p_recall
 |------|-----------|------------|
 | **XGBoost (weighted + tuned)** | **Highest mean CV macro-F1 (0.486 ± 0.014)** on the unified OOF pass; best balanced accuracy among non-linear models (~0.54); stronger Euthanasia/Other recall than RF/SVM | Slightly lower overall accuracy than RF/SVM; less directly interpretable than logistic coefficients |
 | **Random Forest (selected)** | Strong macro-F1 (~0.484); high Adoption/Transfer recall; stable across the Daun `num.trees`/`mtry` grid | Minority recall still poor (Euthanasia ~0.08) |
-| **RBF SVM (selected)** | Competitive macro-F1 (~0.456); strong Adoption/Transfer recall | Very weak Euthanasia recall (~0.05); holdout unused |
+| **RBF SVM (selected)** | Competitive macro-F1 (~0.456); strong Adoption/Transfer recall | Very weak Euthanasia recall (~0.05); no independent holdout for the selected SVM |
 | **Multinomial logistic M3 (improved)** | Strong Return/Other recall; interpretable odds ratios; published holdout close to CV. **Not M0** (M0 macro-F1 ≈ 0.368) | Lowest macro-F1 (~0.441) among the four scored models |
-| **Decision Tree** | Planned interpretable non-linear baseline | Not uploaded—five-model plan incomplete |
+| **Decision Tree** | Planned interpretable non-linear baseline | Still unscored; does not block the four-model final evaluation below |
 
-Artefacts live under `model_comparison/results/` (logistic **M3** from `zilan/`; SVM from `SVM_week12/`; RF via `run_rf_cv.R`; XGBoost via `run_xgb_cv.R` with unified early-stopping OOF).
+Artefacts live under `model_comparison/results/` (logistic **M3** from `zilan/`; SVM from `SVM_week12/`; RF via `run_rf_cv.R`; XGBoost CV via `run_xgb_cv.R`; final XGBoost holdout via `run_xgb_holdout.R`).
 
 ### Final model selection
 
-**Selected model (on scored CV):** **XGBoost** with inverse-frequency class weights and CV-chosen hyperparameters (`max_depth = 6`, `eta = 0.1`, `subsample = 0.8`, `colsample_bytree = 0.85`, `min_child_weight = 1`; mean `best_nrounds` ≈ 184 under early stopping), because it has the highest mean CV macro-F1 (**0.486 ± 0.014**) under the **unified** ranking+recall protocol—narrowly ahead of Random Forest (0.484 ± 0.016)—and also improves balanced accuracy (~0.54) and rare-class recall relative to RF/SVM.
+**Selected model (on scored CV):** **XGBoost** with inverse-frequency class weights and CV-chosen hyperparameters (`max_depth = 6`, `eta = 0.1`, `subsample = 0.8`, `colsample_bytree = 0.85`, `min_child_weight = 1`; mean OOF `best_nrounds` = 184), because it has the highest mean CV macro-F1 (**0.486 ± 0.014**) under the **unified** ranking+recall protocol—narrowly ahead of Random Forest (0.484 ± 0.016)—and also improves balanced accuracy (~0.54) and rare-class recall relative to RF/SVM.
 
-**Stakeholder note.** For intake triage, XGBoost's Euthanasia recall (~0.31) and Other recall (~0.43) from the same OOF pass are closer to the **logistic M3** profile than RF/SVM, while still leading on the primary macro-F1 metric. The decision tree remains outstanding before a fully five-model bake-off.
+**Stakeholder note.** For intake triage, XGBoost's CV Euthanasia recall (~0.31) and Other recall (~0.43) from the same OOF pass are closer to the **logistic M3** profile than RF/SVM, while still leading on the primary macro-F1 metric.
 
-**Holdout.** Only the logistic **M3** contribution has published a one-shot held-out test (macro-F1 ≈ 0.441). SVM, RF and XGBoost left `x_test`/`y_test` unused during tuning. After the decision tree is scored—or if the group freezes the four-model set—the selected model should be **refit once on the full training set and evaluated once on the holdout**.
+### Final holdout evaluation (selected XGBoost)
+
+Selection used only the shared CV folds. The selected XGBoost was then **refit once on the full training set** with the same hyper-parameters and `nrounds = 184` (mean of the five OOF early-stopped iterations—**not** early-stopped on the test set), and scored **once** on the independent 20% holdout. The Decision Tree is still missing from the bake-off; that was previously treated as a reason to defer this step, but it is **not** required for a valid final estimate under the four completed models.
+
+```{r xgb-holdout, message=FALSE, warning=FALSE}
+xgb_holdout <- read.csv(
+  "model_comparison/results/xgb_holdout_metrics.csv",
+  stringsAsFactors = FALSE
+)
+xgb_holdout_pc <- read.csv(
+  "model_comparison/results/xgb_holdout_per_class.csv",
+  stringsAsFactors = FALSE
+)
+zilan_holdout <- read.csv(
+  "model_comparison/results/zilan_metrics_summary.csv",
+  stringsAsFactors = FALSE
+) %>%
+  filter(grepl("Held-out|holdout|test", Evaluation, ignore.case = TRUE))
+
+holdout_summary <- tibble(
+  Model = c("XGBoost (selected, full-train refit)", "Multinomial logistic M3 (reference)"),
+  `Macro-F1` = c(
+    sprintf("%.3f", xgb_holdout$Macro_F1[1]),
+    sprintf("%.3f", zilan_holdout$macro_F1[1])
+  ),
+  `Balanced acc.` = c(
+    sprintf("%.3f", xgb_holdout$Balanced_Accuracy[1]),
+    sprintf("%.3f", zilan_holdout$balanced_accuracy[1])
+  ),
+  Accuracy = c(
+    sprintf("%.3f", xgb_holdout$Accuracy[1]),
+    sprintf("%.3f", zilan_holdout$accuracy[1])
+  )
+)
+kable(
+  holdout_summary,
+  caption = "Independent holdout (20%). XGBoost is the selected final model; logistic M3 is shown for comparison only."
+)
+kable(
+  xgb_holdout_pc %>%
+    transmute(
+      Class,
+      Support,
+      Precision = sprintf("%.3f", Precision),
+      Recall = sprintf("%.3f", Recall),
+      F1 = sprintf("%.3f", F1)
+    ),
+  caption = "Selected XGBoost: per-class holdout metrics (same full-train refit)."
+)
+```
+
+**Holdout result (XGBoost).** Macro-F1 **0.472**, balanced accuracy **0.517**, accuracy **0.686**, with per-class recall Adoption **0.841**, Transfer **0.552**, Return **0.530**, Euthanasia **0.304**, Other **0.358**. Relative to CV (macro-F1 0.486), the holdout is slightly lower, as expected for a single untouched test. Logistic M3's published holdout macro-F1 remains ≈ 0.441.
 
 ### DIP reflection and improvements
 
-**What worked.** Shared preprocessing, a single seed, and common `cv_data` folds made member contributions comparable without re-splitting. Exporting a common CV summary schema (`model_comparison/results/`) let XGBoost, RF, SVM and logistic M3 enter the same table. Primary use of macro-F1 with balanced accuracy and per-class recall matched the imbalanced multi-class problem and stakeholder needs better than accuracy. Fixing xgboost 3.x early-stop attribution kept ranking and recall evidence on one final model.
+**What worked.** Shared preprocessing, a single seed, and common `cv_data` folds made member contributions comparable without re-splitting. Exporting a common CV summary schema (`model_comparison/results/`) let XGBoost, RF, SVM and logistic M3 enter the same table. Primary use of macro-F1 with balanced accuracy and per-class recall matched the imbalanced multi-class problem and stakeholder needs better than accuracy. Fixing xgboost 3.x early-stop attribution kept ranking and recall evidence on one model, and freezing `nrounds` from that OOF pass allowed a clean full-train refit + one-shot holdout.
 
-**What to improve next time.** (1) Freeze the results schema before members finish tuning. (2) Keep the outer holdout unused until *all* planned models finish. (3) Document class-weight tradeoffs in one place. (4) Complete the fifth model (decision tree). (5) Revisit whether `Spayed.Neutered` is fully available at intake (logistic sensitivity checks flagged leakage risk).
+**What to improve next time.** (1) Freeze the results schema before members finish tuning. (2) Keep the outer holdout unused until model selection is finished (done here for XGBoost). (3) Document class-weight tradeoffs in one place. (4) Optionally complete the fifth model (decision tree) for a fuller bake-off. (5) Revisit whether `Spayed.Neutered` is fully available at intake (logistic sensitivity checks flagged leakage risk).
 
 ## 8. Final Results & Conclusion
 
-**Final results and interpretation.** Among the four models with exported shared-fold metrics, **XGBoost** leads on unified-OOF CV macro-F1 (**0.486**), with Random Forest close behind (~0.484). Adoption and Transfer are predicted well by the tree ensembles and SVM; XGBoost and **logistic M3** recover more of the rare Euthanasia/Other cases that matter for triage. The decision tree is still outstanding.
+**Final results and interpretation.** Among the four models with exported shared-fold metrics, **XGBoost** leads on unified-OOF CV macro-F1 (**0.486**), with Random Forest close behind (~0.484). After a full-training-set refit and a single holdout evaluation, the selected XGBoost attains holdout macro-F1 **0.472** (balanced accuracy **0.517**, accuracy **0.686**). Adoption and Transfer remain the easiest classes; Return/Euthanasia/Other stay harder. **Logistic M3** still offers useful rare-class recall and interpretability (holdout macro-F1 ≈ 0.441). The Decision Tree is unscored and does not change this four-model conclusion.
 
-**Answer to the research question.** Intake-time characteristics of cats and dogs carry moderate predictive signal for the five consolidated outcomes: CV macro-F1 values around 0.44–0.49 clearly beat a majority-class baseline (~0.14) but leave substantial error on minority classes. Predictions can support prioritisation, not autonomous outcome determination.
+**Answer to the research question.** Intake-time characteristics of cats and dogs carry moderate predictive signal for the five consolidated outcomes: CV macro-F1 values around 0.44–0.49, and a selected-model holdout of **0.472**, clearly beat a majority-class baseline (~0.14) but leave substantial error on minority classes. Predictions can support prioritisation, not autonomous outcome determination.
 
-**Limitations and future work.** Predictors may not all be known at true intake; labels are imbalanced; EDA saw the full selected subset before modelling; analysis uses each animal's latest admission only; and results may not generalise to other shelters or periods. Next steps are to finish the decision-tree CV export, then run a single holdout evaluation of the final chosen model.
+**Limitations and future work.** Predictors may not all be known at true intake; labels are imbalanced; EDA saw the full selected subset before modelling; analysis uses each animal's latest admission only; and results may not generalise to other shelters or periods. A decision-tree CV export would complete the original five-model plan but is not required to interpret the selected XGBoost holdout above.
 
 ## References
 
