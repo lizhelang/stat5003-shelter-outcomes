@@ -3113,8 +3113,9 @@ inverse-frequency weights + extended age features)</strong>, not plain
 <td>Slightly ahead of RF on mean CV macro-F1 (<strong>0.486 ±
 0.014</strong> vs ~0.484); better minority-class recall
 (Euthanasia/Other) than RF/SVM; balanced accuracy ~0.54</td>
-<td>Slightly lower overall accuracy than RF/SVM; less directly
-interpretable than logistic coefficients</td>
+<td>Lower overall accuracy than RF/SVM by about <strong>10.6 percentage
+points</strong> (CV ~0.694 vs ~0.800); less directly interpretable than
+a plain logistic</td>
 </tr>
 <tr class="even">
 <td><strong>Random Forest (selected)</strong></td>
@@ -3131,9 +3132,13 @@ selected SVM</td>
 </tr>
 <tr class="even">
 <td><strong>Multinomial logistic M3 (improved)</strong></td>
-<td>Strong Return/Other recall; interpretable odds ratios; published
-holdout close to CV. <strong>Not M0</strong> (M0 macro-F1 ≈ 0.368)</td>
-<td>Lowest macro-F1 (~0.441) among the four scored models</td>
+<td>Strong Return/Other recall; published holdout close to CV.
+<strong>Not M0</strong> (M0 macro-F1 ≈ 0.368). Stakeholder odds ratios
+come from a <strong>separate unpenalised/unweighted multinomial on base
+features</strong> (zilan), <strong>not</strong> from M3’s penalised
+coefficients</td>
+<td>Lowest macro-F1 (~0.441) among the four scored models; M3 itself is
+a regularised glmnet fit and does not supply those ORs</td>
 </tr>
 <tr class="odd">
 <td><strong>Decision Tree</strong></td>
@@ -3344,11 +3349,15 @@ slightly ahead of Random Forest</strong> on unified-OOF CV macro-F1
 <strong>better minority-class recall</strong>. After a full-training-set
 refit and a single holdout evaluation, the selected XGBoost attains
 holdout macro-F1 <strong>0.472</strong> (balanced accuracy
-<strong>0.517</strong>, accuracy <strong>0.686</strong>). Adoption and
-Transfer remain the easiest classes; Return/Euthanasia/Other stay
-harder. <strong>Logistic M3</strong> still offers useful rare-class
-recall and interpretability (holdout macro-F1 ≈ 0.441). The Decision
-Tree is unscored and does not change this four-model conclusion.</p>
+<strong>0.517</strong>, accuracy <strong>0.686</strong>—about
+<strong>10.6 percentage points</strong> lower overall accuracy than
+RF/SVM’s ~0.80 CV accuracy). Adoption and Transfer remain the easiest
+classes; Return/Euthanasia/Other stay harder. <strong>Logistic
+M3</strong> still offers useful rare-class recall (holdout macro-F1 ≈
+0.441); reported odds ratios are from zilan’s <strong>separate baseline
+interpretation model</strong>, not from M3’s own coefficients. The
+Decision Tree is unscored and does not change this four-model
+conclusion.</p>
 <p><strong>Answer to the research question.</strong> Intake-time
 characteristics of cats and dogs carry moderate predictive signal for
 the five consolidated outcomes: CV macro-F1 values around 0.44–0.49, and

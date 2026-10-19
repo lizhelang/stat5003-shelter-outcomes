@@ -1792,10 +1792,10 @@ p_recall
 
 | Model | Strengths | Weaknesses |
 |------|-----------|------------|
-| **XGBoost (weighted + tuned)** | Slightly ahead of RF on mean CV macro-F1 (**0.486 ± 0.014** vs ~0.484); better minority-class recall (Euthanasia/Other) than RF/SVM; balanced accuracy ~0.54 | Slightly lower overall accuracy than RF/SVM; less directly interpretable than logistic coefficients |
+| **XGBoost (weighted + tuned)** | Slightly ahead of RF on mean CV macro-F1 (**0.486 ± 0.014** vs ~0.484); better minority-class recall (Euthanasia/Other) than RF/SVM; balanced accuracy ~0.54 | Lower overall accuracy than RF/SVM by about **10.6 percentage points** (CV ~0.694 vs ~0.800); less directly interpretable than a plain logistic |
 | **Random Forest (selected)** | Nearly matching macro-F1 (~0.484); high Adoption/Transfer recall; stable across the Daun `num.trees`/`mtry` grid | Minority recall still poor (Euthanasia ~0.08) |
 | **RBF SVM (selected)** | Competitive macro-F1 (~0.456); strong Adoption/Transfer recall | Very weak Euthanasia recall (~0.05); no independent holdout for the selected SVM |
-| **Multinomial logistic M3 (improved)** | Strong Return/Other recall; interpretable odds ratios; published holdout close to CV. **Not M0** (M0 macro-F1 ≈ 0.368) | Lowest macro-F1 (~0.441) among the four scored models |
+| **Multinomial logistic M3 (improved)** | Strong Return/Other recall; published holdout close to CV. **Not M0** (M0 macro-F1 ≈ 0.368). Stakeholder odds ratios come from a **separate unpenalised/unweighted multinomial on base features** (zilan), **not** from M3’s penalised coefficients | Lowest macro-F1 (~0.441) among the four scored models; M3 itself is a regularised glmnet fit and does not supply those ORs |
 | **Decision Tree** | Planned interpretable non-linear baseline | Still unscored; does not block the four-model final evaluation below |
 
 Artefacts live under `model_comparison/results/` (logistic **M3** from `zilan/`; SVM from `SVM_week12/`; RF via `run_rf_cv.R`; XGBoost CV via `run_xgb_cv.R`; final XGBoost holdout via `run_xgb_holdout.R`).
@@ -1867,7 +1867,7 @@ kable(
 
 ## 8. Final Results & Conclusion
 
-**Final results and interpretation.** Among the four models with exported shared-fold metrics, **XGBoost is only slightly ahead of Random Forest** on unified-OOF CV macro-F1 (**0.486** vs ~**0.484**) and shows **better minority-class recall**. After a full-training-set refit and a single holdout evaluation, the selected XGBoost attains holdout macro-F1 **0.472** (balanced accuracy **0.517**, accuracy **0.686**). Adoption and Transfer remain the easiest classes; Return/Euthanasia/Other stay harder. **Logistic M3** still offers useful rare-class recall and interpretability (holdout macro-F1 ≈ 0.441). The Decision Tree is unscored and does not change this four-model conclusion.
+**Final results and interpretation.** Among the four models with exported shared-fold metrics, **XGBoost is only slightly ahead of Random Forest** on unified-OOF CV macro-F1 (**0.486** vs ~**0.484**) and shows **better minority-class recall**. After a full-training-set refit and a single holdout evaluation, the selected XGBoost attains holdout macro-F1 **0.472** (balanced accuracy **0.517**, accuracy **0.686**—about **10.6 percentage points** lower overall accuracy than RF/SVM’s ~0.80 CV accuracy). Adoption and Transfer remain the easiest classes; Return/Euthanasia/Other stay harder. **Logistic M3** still offers useful rare-class recall (holdout macro-F1 ≈ 0.441); reported odds ratios are from zilan’s **separate baseline interpretation model**, not from M3’s own coefficients. The Decision Tree is unscored and does not change this four-model conclusion.
 
 **Answer to the research question.** Intake-time characteristics of cats and dogs carry moderate predictive signal for the five consolidated outcomes: CV macro-F1 values around 0.44–0.49, and a selected-model holdout of **0.472**, clearly beat a majority-class baseline (~0.14) but leave substantial error on minority classes. Predictions can support prioritisation, not autonomous outcome determination.
 
