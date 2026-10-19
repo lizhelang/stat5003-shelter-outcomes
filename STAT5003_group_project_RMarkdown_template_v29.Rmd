@@ -1459,18 +1459,42 @@ mean(fold_macro); sd(fold_macro)
 
 ### Improvement Strategy
 
+Each completed model was improved on the **shared** `cv_data` folds only; `x_test`/`y_test` were not used for tuning. Primary selection metric is mean CV macro-F1.
 
+| Model | Member source | What was improved |
+|------|---------------|-------------------|
+| **Random Forest** | `Daun_rf` §6 | Grid over `num.trees` ∈ {100, 300, 500} and `mtry` ∈ {2, 4, 8} |
+| **XGBoost** | Janet (`branch-janet` §5 tuned chunk; no separate §6 text) | Inverse-frequency weights + hyper-parameter grid + early stopping |
+| **RBF SVM** | `Jackson_SVM` / `SVM_week12` | Grid over C, γ multiplier, and weighting (18 configs) |
+| **Logistic** | `zilan/logistic_regression.Rmd` (tuning ladder; no separate §6 in template) | M0 → M1 weights → M2 glmnet → **M3** (+ age features); α/λ by 1-SE |
 
 ### Improvement Results
 
-#### Random Forest: hyperparameter tuning
+#### Random Forest (Daun)
 
 We tune the number of trees (`num.trees`: 100, 300, 500) and the number of predictors considered at each split (`mtry`: 2, 4, 8). All other settings remain at their defaults. Each combination is evaluated using the shared five-fold cross-validation data, and the combination with the highest mean macro-F1 is selected. Test results are not used to choose the parameters.
+
+**Selected for comparison:** `num.trees = 500`, `mtry = 4` (mean CV macro-F1 ≈ 0.484), versus the default-style baseline `num.trees = 500`, `mtry = 2` (≈ 0.419). Full grid: `model_comparison/results/rf_cv_summary.csv`.
+
+```{r rf-improvement-summary, message=FALSE, warning=FALSE}
+rf_cv_sum <- read.csv("model_comparison/results/rf_cv_summary.csv")
+rf_sel <- rf_cv_sum[which.max(rf_cv_sum$Mean_Macro_F1), ]
+rf_base <- subset(rf_cv_sum, num.trees == 500 & mtry == 2)
+knitr::kable(
+  rbind(
+    data.frame(Variant = "Baseline (500, mtry=2)", rf_base[1, c("Mean_Macro_F1", "SD_Macro_F1")]),
+    data.frame(Variant = "Selected (500, mtry=4)", rf_sel[1, c("Mean_Macro_F1", "SD_Macro_F1")])
+  ),
+  digits = 3,
+  caption = "Random Forest: baseline vs selected (shared 5-fold CV)"
+)
+```
+
 ```{r rf-tuning, eval=FALSE}
+# Daun RF grid (same as model_comparison/run_rf_cv.R / Daun_rf §6)
+library(ranger)
 rf_grid <- expand.grid(num.trees = c(100, 300, 500), mtry = c(2, 4, 8))
 rf_cv_results <- data.frame()
-
-# Try each parameter combination on the same five folds.
 for (i in 1:nrow(rf_grid)) {
   for (k in seq_along(cv_data)) {
     fold <- cv_data[[k]]
@@ -1480,39 +1504,129 @@ for (i in 1:nrow(rf_grid)) {
       mtry = rf_grid$mtry[i], seed = 5003 + k
     )
     preds <- predict(rf_model, data = fold$x_valid)$predictions
-    # Calculate F1 for each outcome in this validation fold.
     rf_fold_f1 <- c()
     for (class in levels(fold$y_valid)) {
       actual_count <- sum(fold$y_valid == class)
       predicted_count <- sum(preds == class)
       correct_count <- sum(fold$y_valid == class & preds == class)
-
       rf_fold_f1[class] <- 2 * correct_count / (actual_count + predicted_count)
     }
-
     rf_cv_results <- rbind(rf_cv_results, data.frame(
       num.trees = rf_grid$num.trees[i], mtry = rf_grid$mtry[i],
       Fold = k, Macro_F1 = mean(rf_fold_f1)
     ))
   }
 }
-
-# Average the validation scores and select the best combination.
 rf_cv_summary <- rf_cv_results %>%
   group_by(num.trees, mtry) %>%
-  summarise(Mean_Macro_F1 = mean(Macro_F1),
-            SD_Macro_F1 = sd(Macro_F1), .groups = "drop")
+  summarise(Mean_Macro_F1 = mean(Macro_F1), SD_Macro_F1 = sd(Macro_F1), .groups = "drop")
 rf_best <- rf_cv_summary[which.max(rf_cv_summary$Mean_Macro_F1), ]
-rf_baseline_cv <- rf_cv_summary %>% filter(num.trees == 500, mtry == 2)
-knitr::kable(rf_cv_summary, digits = 4,
-             caption = "Random Forest: five-fold cross-validation results")
-
+# Expected: num.trees=500, mtry=4
 ```
 
-```{r model-improvement, eval=FALSE}
-# TODO: add tuning/feature-selection code and compare initial versus improved CV results.
+#### XGBoost (Janet)
 
+Janet’s template left §6 as a TODO; the improvement work sits in the **model-fitting** section (`fit-xgboost-tuned`: cost-sensitive weights + grid search). That design is what the comparison uses.
 
+**Improvements:** (1) inverse-frequency observation weights; (2) grid over `max_depth` ∈ {4, 6}, `eta` ∈ {0.05, 0.10}, `colsample_bytree` ∈ {0.70, 0.85}, `min_child_weight` ∈ {1, 3} (`subsample = 0.8`); (3) early stopping (max 250 rounds, stop after 20 non-improving rounds on the fold validation set; xgboost 3.x `evals=` + `attr(bst,"early_stop")$best_iteration`).
+
+**Selected for comparison:** `max_depth = 6`, `eta = 0.1`, `colsample_bytree = 0.85`, `min_child_weight = 1`, mean OOF `best_nrounds` ≈ 184; unified OOF mean CV macro-F1 ≈ **0.486** (see `xgb_selected_metrics.csv`). Driver: `model_comparison/run_xgb_cv.R`. Foldable tuning code is in §5 (`fit-xgboost-tuned`); summary of the exported selection:
+
+```{r xgb-improvement-summary, message=FALSE, warning=FALSE}
+xgb_sel <- read.csv("model_comparison/results/xgb_selected_metrics.csv")
+knitr::kable(
+  data.frame(
+    Variant = c("Baseline (unweighted, 100 rounds)", "Selected (weighted + tuned OOF)"),
+    Mean_CV_Macro_F1 = c(
+      xgb_sel$Baseline_Mean_CV_Macro_F1[1],
+      xgb_sel$Mean_CV_Macro_F1[1]
+    ),
+    SD = c(xgb_sel$Baseline_SD_CV_Macro_F1[1], xgb_sel$SD_CV_Macro_F1[1]),
+    Notes = c(
+      "max_depth=6, eta=0.3, fixed 100 rounds",
+      sprintf(
+        "depth=%s eta=%s colsample=%s min_child=%s; mean best_nrounds=%.0f",
+        xgb_sel$max_depth[1], xgb_sel$eta[1], xgb_sel$colsample_bytree[1],
+        xgb_sel$min_child_weight[1], xgb_sel$Mean_best_nrounds[1]
+      )
+    )
+  ),
+  digits = 3,
+  caption = "XGBoost: baseline vs selected unified-OOF metrics (Janet design)"
+)
+```
+
+```{r xgb-tuning-core, eval=FALSE}
+# Janet improvement core (see also §5 fit-xgboost-tuned and run_xgb_cv.R).
+# Selected config used in §7 / holdout:
+# max_depth=6, eta=0.1, subsample=0.8, colsample_bytree=0.85, min_child_weight=1
+tuning_grid <- expand.grid(
+  max_depth = c(4, 6), eta = c(0.05, 0.10), subsample = 0.80,
+  colsample_bytree = c(0.70, 0.85), min_child_weight = c(1, 3)
+)
+# Per fold: inverse-frequency weights → xgb.train(..., nrounds=250,
+#   evals=list(eval=dvalid), early_stopping_rounds=20)
+# Ranking + per-class recall: one subsequent OOF pass of the winner only.
+```
+
+#### RBF SVM (Jackson)
+
+From `SVM_week12/SVM_results.Rmd` / `Jackson_SVM` §6: baseline `C = 1`, `gamma = 1/p`, no class weights. A fixed grid compares `C` ∈ {0.1, 1, 10}, gamma multipliers ∈ {0.25, 1, 4} (applied to `1/p`), and unweighted vs inverse-frequency weights (18 configurations, 90 fold fits). Select by highest mean fold macro-F1 (ties: lower SD, then lower C and gamma multiplier).
+
+**Selected for comparison:** **C = 10**, **γ = 4/p**, **unweighted** — mean CV macro-F1 ≈ **0.456** vs baseline ≈ **0.349** (+0.106). The best *weighted* candidate was close on macro-F1 but was not selected under the stated rule. Exports: `SVM_week12/svm_results/` (copied into `model_comparison/results/`).
+
+```{r svm-improvement-summary, message=FALSE, warning=FALSE}
+svm_cmp <- read.csv("model_comparison/results/svm_baseline_vs_selected.csv")
+knitr::kable(
+  svm_cmp[, c("Model", "C", "Gamma_multiplier", "Weighting",
+              "Mean_Macro_F1", "SD_Macro_F1",
+              "Mean_Balanced_Accuracy", "Mean_Accuracy")],
+  digits = 3,
+  caption = "SVM baseline versus selected configuration (Jackson; shared 5-fold CV)"
+)
+```
+
+```{r svm-tuning-core, eval=FALSE}
+# Jackson SVM improvement grid (see SVM_week12/svm_model.R)
+grid <- expand.grid(
+  C = c(0.1, 1, 10),
+  Gamma_multiplier = c(0.25, 1, 4),
+  Weighting = c("none", "inverse"),
+  stringsAsFactors = FALSE
+)
+# Baseline candidate: C=1, Gamma_multiplier=1, Weighting="none"
+# Selected by mean CV macro-F1: C=10, Gamma_multiplier=4, Weighting="none"
+# Full runner: source("SVM_week12/svm_model.R") after building cv_data.
+```
+
+#### Multinomial logistic — M3 (zilan)
+
+zilan’s template §6 was empty; the improvement ladder is in `zilan/logistic_regression.Rmd` §3 (“Models and tuning”):
+
+* **M0** – plain `nnet::multinom`, base features, no weights.
+* **M1** – M0 + inverse-frequency class weights.
+* **M2** – weighted `glmnet` multinomial (grouped penalty), base features; α ∈ {0, 0.25, 0.5, 0.75, 1}, λ by CV macro-F1.
+* **M3** – M2 + extended age features (`ns(log1p(age), 3)`, Dog × log-age, `age_missing` flag).
+
+λ uses the **one-standard-error** rule. Grouped elastic-net shrinkage is the feature-selection step. **Comparison / §7 uses M3** (α = 0.5, λ ≈ 0.026), not M0.
+
+```{r lr-improvement-summary, message=FALSE, warning=FALSE}
+lr_cv <- read.csv("model_comparison/results/zilan_cv_model_comparison.csv")
+knitr::kable(
+  lr_cv[, c("Model", "macro_F1", "macro_F1_sd", "balanced_accuracy", "accuracy")],
+  digits = 3,
+  caption = "Logistic ladder on shared folds (zilan). Comparison row = M3."
+)
+```
+
+```{r lr-tuning-core, eval=FALSE}
+# zilan improvement ladder (full code: zilan/logistic_regression.Rmd)
+# M0: multinom, base design, no weights
+# M1: multinom + inverse-frequency weights
+# M2: glmnet multinomial grouped, base design, tune alpha/lambda
+# M3: as M2 + extended age features  ← used in §7
+# Selected M3 (1-SE): alpha = 0.5, lambda ≈ 0.02598
+# Foldable M3 fit core also appears in §5 (fit-multinomial).
 ```
 
 ## 7. Model Evaluation & Selection

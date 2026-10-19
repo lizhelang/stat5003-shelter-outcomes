@@ -2448,11 +2448,56 @@ characteristics are used in the main classification decisions.</li>
 <h2>6. Model Improvement</h2>
 <div id="improvement-strategy" class="section level3">
 <h3>Improvement Strategy</h3>
+<p>Each completed model was improved on the <strong>shared</strong>
+<code>cv_data</code> folds only; <code>x_test</code>/<code>y_test</code>
+were not used for tuning. Primary selection metric is mean CV
+macro-F1.</p>
+<table>
+<colgroup>
+<col width="15%" />
+<col width="37%" />
+<col width="47%" />
+</colgroup>
+<thead>
+<tr class="header">
+<th>Model</th>
+<th>Member source</th>
+<th>What was improved</th>
+</tr>
+</thead>
+<tbody>
+<tr class="odd">
+<td><strong>Random Forest</strong></td>
+<td><code>Daun_rf</code> §6</td>
+<td>Grid over <code>num.trees</code> ∈ {100, 300, 500} and
+<code>mtry</code> ∈ {2, 4, 8}</td>
+</tr>
+<tr class="even">
+<td><strong>XGBoost</strong></td>
+<td>Janet (<code>branch-janet</code> §5 tuned chunk; no separate §6
+text)</td>
+<td>Inverse-frequency weights + hyper-parameter grid + early
+stopping</td>
+</tr>
+<tr class="odd">
+<td><strong>RBF SVM</strong></td>
+<td><code>Jackson_SVM</code> / <code>SVM_week12</code></td>
+<td>Grid over C, γ multiplier, and weighting (18 configs)</td>
+</tr>
+<tr class="even">
+<td><strong>Logistic</strong></td>
+<td><code>zilan/logistic_regression.Rmd</code> (tuning ladder; no
+separate §6 in template)</td>
+<td>M0 → M1 weights → M2 glmnet → <strong>M3</strong> (+ age features);
+α/λ by 1-SE</td>
+</tr>
+</tbody>
+</table>
 </div>
 <div id="improvement-results" class="section level3">
 <h3>Improvement Results</h3>
-<div id="random-forest-hyperparameter-tuning" class="section level4">
-<h4>Random Forest: hyperparameter tuning</h4>
+<div id="random-forest-daun" class="section level4">
+<h4>Random Forest (Daun)</h4>
 <p>We tune the number of trees (<code>num.trees</code>: 100, 300, 500)
 and the number of predictors considered at each split
 (<code>mtry</code>: 2, 4, 8). All other settings remain at their
@@ -2460,10 +2505,52 @@ defaults. Each combination is evaluated using the shared five-fold
 cross-validation data, and the combination with the highest mean
 macro-F1 is selected. Test results are not used to choose the
 parameters.</p>
-<pre class="r fold-hide"><code>rf_grid &lt;- expand.grid(num.trees = c(100, 300, 500), mtry = c(2, 4, 8))
+<p><strong>Selected for comparison:</strong>
+<code>num.trees = 500</code>, <code>mtry = 4</code> (mean CV macro-F1 ≈
+0.484), versus the default-style baseline <code>num.trees = 500</code>,
+<code>mtry = 2</code> (≈ 0.419). Full grid:
+<code>model_comparison/results/rf_cv_summary.csv</code>.</p>
+<pre class="r fold-hide"><code>rf_cv_sum &lt;- read.csv(&quot;model_comparison/results/rf_cv_summary.csv&quot;)
+rf_sel &lt;- rf_cv_sum[which.max(rf_cv_sum$Mean_Macro_F1), ]
+rf_base &lt;- subset(rf_cv_sum, num.trees == 500 &amp; mtry == 2)
+knitr::kable(
+  rbind(
+    data.frame(Variant = &quot;Baseline (500, mtry=2)&quot;, rf_base[1, c(&quot;Mean_Macro_F1&quot;, &quot;SD_Macro_F1&quot;)]),
+    data.frame(Variant = &quot;Selected (500, mtry=4)&quot;, rf_sel[1, c(&quot;Mean_Macro_F1&quot;, &quot;SD_Macro_F1&quot;)])
+  ),
+  digits = 3,
+  caption = &quot;Random Forest: baseline vs selected (shared 5-fold CV)&quot;
+)</code></pre>
+<table>
+<caption>Random Forest: baseline vs selected (shared 5-fold
+CV)</caption>
+<thead>
+<tr class="header">
+<th align="left"></th>
+<th align="left">Variant</th>
+<th align="right">Mean_Macro_F1</th>
+<th align="right">SD_Macro_F1</th>
+</tr>
+</thead>
+<tbody>
+<tr class="odd">
+<td align="left">8</td>
+<td align="left">Baseline (500, mtry=2)</td>
+<td align="right">0.419</td>
+<td align="right">0.013</td>
+</tr>
+<tr class="even">
+<td align="left">1</td>
+<td align="left">Selected (500, mtry=4)</td>
+<td align="right">0.484</td>
+<td align="right">0.016</td>
+</tr>
+</tbody>
+</table>
+<pre class="r fold-hide"><code># Daun RF grid (same as model_comparison/run_rf_cv.R / Daun_rf §6)
+library(ranger)
+rf_grid &lt;- expand.grid(num.trees = c(100, 300, 500), mtry = c(2, 4, 8))
 rf_cv_results &lt;- data.frame()
-
-# Try each parameter combination on the same five folds.
 for (i in 1:nrow(rf_grid)) {
   for (k in seq_along(cv_data)) {
     fold &lt;- cv_data[[k]]
@@ -2473,33 +2560,283 @@ for (i in 1:nrow(rf_grid)) {
       mtry = rf_grid$mtry[i], seed = 5003 + k
     )
     preds &lt;- predict(rf_model, data = fold$x_valid)$predictions
-    # Calculate F1 for each outcome in this validation fold.
     rf_fold_f1 &lt;- c()
     for (class in levels(fold$y_valid)) {
       actual_count &lt;- sum(fold$y_valid == class)
       predicted_count &lt;- sum(preds == class)
       correct_count &lt;- sum(fold$y_valid == class &amp; preds == class)
-
       rf_fold_f1[class] &lt;- 2 * correct_count / (actual_count + predicted_count)
     }
-
     rf_cv_results &lt;- rbind(rf_cv_results, data.frame(
       num.trees = rf_grid$num.trees[i], mtry = rf_grid$mtry[i],
       Fold = k, Macro_F1 = mean(rf_fold_f1)
     ))
   }
 }
-
-# Average the validation scores and select the best combination.
 rf_cv_summary &lt;- rf_cv_results %&gt;%
   group_by(num.trees, mtry) %&gt;%
-  summarise(Mean_Macro_F1 = mean(Macro_F1),
-            SD_Macro_F1 = sd(Macro_F1), .groups = &quot;drop&quot;)
+  summarise(Mean_Macro_F1 = mean(Macro_F1), SD_Macro_F1 = sd(Macro_F1), .groups = &quot;drop&quot;)
 rf_best &lt;- rf_cv_summary[which.max(rf_cv_summary$Mean_Macro_F1), ]
-rf_baseline_cv &lt;- rf_cv_summary %&gt;% filter(num.trees == 500, mtry == 2)
-knitr::kable(rf_cv_summary, digits = 4,
-             caption = &quot;Random Forest: five-fold cross-validation results&quot;)</code></pre>
-<pre class="r fold-hide"><code># TODO: add tuning/feature-selection code and compare initial versus improved CV results.</code></pre>
+# Expected: num.trees=500, mtry=4</code></pre>
+</div>
+<div id="xgboost-janet" class="section level4">
+<h4>XGBoost (Janet)</h4>
+<p>Janet’s template left §6 as a TODO; the improvement work sits in the
+<strong>model-fitting</strong> section (<code>fit-xgboost-tuned</code>:
+cost-sensitive weights + grid search). That design is what the
+comparison uses.</p>
+<p><strong>Improvements:</strong> (1) inverse-frequency observation
+weights; (2) grid over <code>max_depth</code> ∈ {4, 6}, <code>eta</code>
+∈ {0.05, 0.10}, <code>colsample_bytree</code> ∈ {0.70, 0.85},
+<code>min_child_weight</code> ∈ {1, 3} (<code>subsample = 0.8</code>);
+(3) early stopping (max 250 rounds, stop after 20 non-improving rounds
+on the fold validation set; xgboost 3.x <code>evals=</code> +
+<code>attr(bst,&quot;early_stop&quot;)$best_iteration</code>).</p>
+<p><strong>Selected for comparison:</strong> <code>max_depth = 6</code>,
+<code>eta = 0.1</code>, <code>colsample_bytree = 0.85</code>,
+<code>min_child_weight = 1</code>, mean OOF <code>best_nrounds</code> ≈
+184; unified OOF mean CV macro-F1 ≈ <strong>0.486</strong> (baseline
+unweighted 100-round CV ≈ 0.486 on folds, but selected weighted OOF is
+the ranking row—see <code>xgb_selected_metrics.csv</code>). Driver:
+<code>model_comparison/run_xgb_cv.R</code>. Foldable tuning code is in
+§5 (<code>fit-xgboost-tuned</code>); summary of the exported
+selection:</p>
+<pre class="r fold-hide"><code>xgb_sel &lt;- read.csv(&quot;model_comparison/results/xgb_selected_metrics.csv&quot;)
+knitr::kable(
+  data.frame(
+    Variant = c(&quot;Baseline (unweighted, 100 rounds)&quot;, &quot;Selected (weighted + tuned OOF)&quot;),
+    Mean_CV_Macro_F1 = c(
+      xgb_sel$Baseline_Mean_CV_Macro_F1[1],
+      xgb_sel$Mean_CV_Macro_F1[1]
+    ),
+    SD = c(xgb_sel$Baseline_SD_CV_Macro_F1[1], xgb_sel$SD_CV_Macro_F1[1]),
+    Notes = c(
+      &quot;max_depth=6, eta=0.3, fixed 100 rounds&quot;,
+      sprintf(
+        &quot;depth=%s eta=%s colsample=%s min_child=%s; mean best_nrounds=%.0f&quot;,
+        xgb_sel$max_depth[1], xgb_sel$eta[1], xgb_sel$colsample_bytree[1],
+        xgb_sel$min_child_weight[1], xgb_sel$Mean_best_nrounds[1]
+      )
+    )
+  ),
+  digits = 3,
+  caption = &quot;XGBoost: baseline vs selected unified-OOF metrics (Janet design)&quot;
+)</code></pre>
+<table>
+<caption>XGBoost: baseline vs selected unified-OOF metrics (Janet
+design)</caption>
+<colgroup>
+<col width="27%" />
+<col width="13%" />
+<col width="4%" />
+<col width="53%" />
+</colgroup>
+<thead>
+<tr class="header">
+<th align="left">Variant</th>
+<th align="right">Mean_CV_Macro_F1</th>
+<th align="right">SD</th>
+<th align="left">Notes</th>
+</tr>
+</thead>
+<tbody>
+<tr class="odd">
+<td align="left">Baseline (unweighted, 100 rounds)</td>
+<td align="right">0.486</td>
+<td align="right">0.019</td>
+<td align="left">max_depth=6, eta=0.3, fixed 100 rounds</td>
+</tr>
+<tr class="even">
+<td align="left">Selected (weighted + tuned OOF)</td>
+<td align="right">0.486</td>
+<td align="right">0.014</td>
+<td align="left">depth=6 eta=0.1 colsample=0.85 min_child=1; mean
+best_nrounds=184</td>
+</tr>
+</tbody>
+</table>
+<pre class="r fold-hide"><code># Janet improvement core (see also §5 fit-xgboost-tuned and run_xgb_cv.R).
+# Selected config used in §7 / holdout:
+# max_depth=6, eta=0.1, subsample=0.8, colsample_bytree=0.85, min_child_weight=1
+tuning_grid &lt;- expand.grid(
+  max_depth = c(4, 6), eta = c(0.05, 0.10), subsample = 0.80,
+  colsample_bytree = c(0.70, 0.85), min_child_weight = c(1, 3)
+)
+# Per fold: inverse-frequency weights → xgb.train(..., nrounds=250,
+#   evals=list(eval=dvalid), early_stopping_rounds=20)
+# Ranking + per-class recall: one subsequent OOF pass of the winner only.</code></pre>
+</div>
+<div id="rbf-svm-jackson" class="section level4">
+<h4>RBF SVM (Jackson)</h4>
+<p>From <code>SVM_week12/SVM_results.Rmd</code> /
+<code>Jackson_SVM</code> §6: baseline <code>C = 1</code>,
+<code>gamma = 1/p</code>, no class weights. A fixed grid compares
+<code>C</code> ∈ {0.1, 1, 10}, gamma multipliers ∈ {0.25, 1, 4} (applied
+to <code>1/p</code>), and unweighted vs inverse-frequency weights (18
+configurations, 90 fold fits). Select by highest mean fold macro-F1
+(ties: lower SD, then lower C and gamma multiplier).</p>
+<p><strong>Selected for comparison:</strong> <strong>C = 10</strong>,
+<strong>γ = 4/p</strong>, <strong>unweighted</strong> — mean CV macro-F1
+≈ <strong>0.456</strong> vs baseline ≈ <strong>0.349</strong> (+0.106).
+The best <em>weighted</em> candidate was close on macro-F1 but was not
+selected under the stated rule. Exports:
+<code>SVM_week12/svm_results/</code> (copied into
+<code>model_comparison/results/</code>).</p>
+<pre class="r fold-hide"><code>svm_cmp &lt;- read.csv(&quot;model_comparison/results/svm_baseline_vs_selected.csv&quot;)
+knitr::kable(
+  svm_cmp[, c(&quot;Model&quot;, &quot;C&quot;, &quot;Gamma_multiplier&quot;, &quot;Weighting&quot;,
+              &quot;Mean_Macro_F1&quot;, &quot;SD_Macro_F1&quot;,
+              &quot;Mean_Balanced_Accuracy&quot;, &quot;Mean_Accuracy&quot;)],
+  digits = 3,
+  caption = &quot;SVM baseline versus selected configuration (Jackson; shared 5-fold CV)&quot;
+)</code></pre>
+<table>
+<caption>SVM baseline versus selected configuration (Jackson; shared
+5-fold CV)</caption>
+<colgroup>
+<col width="16%" />
+<col width="2%" />
+<col width="15%" />
+<col width="8%" />
+<col width="12%" />
+<col width="10%" />
+<col width="20%" />
+<col width="12%" />
+</colgroup>
+<thead>
+<tr class="header">
+<th align="left">Model</th>
+<th align="right">C</th>
+<th align="right">Gamma_multiplier</th>
+<th align="left">Weighting</th>
+<th align="right">Mean_Macro_F1</th>
+<th align="right">SD_Macro_F1</th>
+<th align="right">Mean_Balanced_Accuracy</th>
+<th align="right">Mean_Accuracy</th>
+</tr>
+</thead>
+<tbody>
+<tr class="odd">
+<td align="left">SVM baseline</td>
+<td align="right">1</td>
+<td align="right">1</td>
+<td align="left">none</td>
+<td align="right">0.349</td>
+<td align="right">0.003</td>
+<td align="right">0.377</td>
+<td align="right">0.795</td>
+</tr>
+<tr class="even">
+<td align="left">SVM selected by CV</td>
+<td align="right">10</td>
+<td align="right">4</td>
+<td align="left">none</td>
+<td align="right">0.456</td>
+<td align="right">0.012</td>
+<td align="right">0.440</td>
+<td align="right">0.800</td>
+</tr>
+</tbody>
+</table>
+<pre class="r fold-hide"><code># Jackson SVM improvement grid (see SVM_week12/svm_model.R)
+grid &lt;- expand.grid(
+  C = c(0.1, 1, 10),
+  Gamma_multiplier = c(0.25, 1, 4),
+  Weighting = c(&quot;none&quot;, &quot;inverse&quot;),
+  stringsAsFactors = FALSE
+)
+# Baseline candidate: C=1, Gamma_multiplier=1, Weighting=&quot;none&quot;
+# Selected by mean CV macro-F1: C=10, Gamma_multiplier=4, Weighting=&quot;none&quot;
+# Full runner: source(&quot;SVM_week12/svm_model.R&quot;) after building cv_data.</code></pre>
+</div>
+<div id="multinomial-logistic-m3-zilan" class="section level4">
+<h4>Multinomial logistic — M3 (zilan)</h4>
+<p>zilan’s template §6 was empty; the improvement ladder is in
+<code>zilan/logistic_regression.Rmd</code> §3 (“Models and tuning”):</p>
+<ul>
+<li><strong>M0</strong> – plain <code>nnet::multinom</code>, base
+features, no weights.</li>
+<li><strong>M1</strong> – M0 + inverse-frequency class weights.</li>
+<li><strong>M2</strong> – weighted <code>glmnet</code> multinomial
+(grouped penalty), base features; α ∈ {0, 0.25, 0.5, 0.75, 1}, λ by CV
+macro-F1.</li>
+<li><strong>M3</strong> – M2 + extended age features
+(<code>ns(log1p(age), 3)</code>, Dog × log-age, <code>age_missing</code>
+flag).</li>
+</ul>
+<p>λ uses the <strong>one-standard-error</strong> rule. Grouped
+elastic-net shrinkage is the feature-selection step. <strong>Comparison
+/ §7 uses M3</strong> (α = 0.5, λ ≈ 0.026), not M0.</p>
+<pre class="r fold-hide"><code>lr_cv &lt;- read.csv(&quot;model_comparison/results/zilan_cv_model_comparison.csv&quot;)
+knitr::kable(
+  lr_cv[, c(&quot;Model&quot;, &quot;macro_F1&quot;, &quot;macro_F1_sd&quot;, &quot;balanced_accuracy&quot;, &quot;accuracy&quot;)],
+  digits = 3,
+  caption = &quot;Logistic ladder on shared folds (zilan). Comparison row = M3.&quot;
+)</code></pre>
+<table>
+<caption>Logistic ladder on shared folds (zilan). Comparison row =
+M3.</caption>
+<colgroup>
+<col width="42%" />
+<col width="10%" />
+<col width="14%" />
+<col width="21%" />
+<col width="10%" />
+</colgroup>
+<thead>
+<tr class="header">
+<th align="left">Model</th>
+<th align="right">macro_F1</th>
+<th align="right">macro_F1_sd</th>
+<th align="right">balanced_accuracy</th>
+<th align="right">accuracy</th>
+</tr>
+</thead>
+<tbody>
+<tr class="odd">
+<td align="left">M3 glmnet + weights + age features</td>
+<td align="right">0.441</td>
+<td align="right">0.012</td>
+<td align="right">0.521</td>
+<td align="right">0.624</td>
+</tr>
+<tr class="even">
+<td align="left">M2 glmnet + weights</td>
+<td align="right">0.437</td>
+<td align="right">0.013</td>
+<td align="right">0.496</td>
+<td align="right">0.687</td>
+</tr>
+<tr class="odd">
+<td align="left">M1 multinom + weights</td>
+<td align="right">0.428</td>
+<td align="right">0.010</td>
+<td align="right">0.487</td>
+<td align="right">0.657</td>
+</tr>
+<tr class="even">
+<td align="left">M0 multinom</td>
+<td align="right">0.368</td>
+<td align="right">0.007</td>
+<td align="right">0.386</td>
+<td align="right">0.792</td>
+</tr>
+<tr class="odd">
+<td align="left">Majority class</td>
+<td align="right">0.138</td>
+<td align="right">0.000</td>
+<td align="right">0.200</td>
+<td align="right">0.524</td>
+</tr>
+</tbody>
+</table>
+<pre class="r fold-hide"><code># zilan improvement ladder (full code: zilan/logistic_regression.Rmd)
+# M0: multinom, base design, no weights
+# M1: multinom + inverse-frequency weights
+# M2: glmnet multinomial grouped, base design, tune alpha/lambda
+# M3: as M2 + extended age features  ← used in §7
+# Selected M3 (1-SE): alpha = 0.5, lambda ≈ 0.02598
+# Foldable M3 fit core also appears in §5 (fit-multinomial).</code></pre>
 </div>
 </div>
 </div>
