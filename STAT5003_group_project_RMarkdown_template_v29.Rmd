@@ -80,16 +80,13 @@ Animal center accepts a variety of animals from wildlife to owned pet. Our datas
 
 **Task and relevance:** Predict the final outcome of cats and dogs—Adoption, Transfer, Return, Euthanasia, or Other—from information available at intake. This real-world task is relevant to shelters managing overcrowding and limited resources.
 
-**Stakeholders and decisions.** Two operational roles are most directly served by intake-time predictions:
-
-1. **Intake triage officers** need a rapid risk signal in the first day after admission so they can prioritise behavioural support and veterinary attention for animals that look more likely to face prolonged stay or unfavourable outcomes (especially Euthanasia and Other).
-2. **Transfer and foster coordinators** need early outcome probabilities to start partner-rescue and foster placement before kennels fill, shortening length of stay for Transfer-prone animals.
-
-Managers allocating kennel space and staff time are secondary users of the same forecasts. The models therefore emphasise macro-F1 and per-class recall, not overall accuracy alone: majority Adoption predictions would look accurate but would not support these triage and placement decisions.
+**Stakeholders:** 
+1. **Intake Triage Officers**: Require immediate prognostication within the initial 24-hour admission window to proactively stratify care, flagging incoming animals at high risk of prolonged confinement or medical deterioration for targeted behavioural rehabilitation and veterinary intervention before irreversible outcomes occur.
+2. **Transfer & Foster Coordinators**: Rely on intake-stage probability trajectories to initiate partner rescue placement and foster network scheduling weeks in advance, preventing kennel bottlenecks and reducing overall Length of Stay (LOS).
 
 **Research question:** To what extent can intake-time information of cats and dogs predict these five shelter outcomes for each animal's latest recorded admission?
 
-**Motivation:** If intake characteristics carry usable signal, staff can prioritise care and placement earlier; if they do not, resources should not be steered by a misleading classifier.
+**Motivation:** Early predictions may help staff prioritise care, allocate resources, and identify animals at greater risk of unfavourable outcomes.
 
 ## 2. Dataset & Justification
 
