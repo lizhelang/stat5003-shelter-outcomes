@@ -1,0 +1,5 @@
+XGBoost comparison protocol
+Tuning grid selects hyper-parameters by mean fold macro-F1 under early stopping.
+Reported ranking macro-F1 / balanced accuracy / per-class recall all come from one
+subsequent OOF pass of the selected hyper-parameters with the same early-stopping rule.
+best_nrounds is attr(bst, "early_stop")$best_iteration (xgboost 3.x).

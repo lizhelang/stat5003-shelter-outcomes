@@ -1146,8 +1146,75 @@ for (k in 1:5) {
 3.  **Class imbalance:** Consider class weighting because Adoption is the majority outcome, while Euthanasia and Other are rare.
 4.  **Evaluation:** Follow the shared outcome-stratified cross-validation plan, using macro-F1 as the primary metric together with balanced accuracy, per-class recall, and a confusion matrix.
 
-```{r fit-multinomial, eval=FALSE}
+**Comparison model (Section 7):** the scored logistic row is **M3 (improved)** — weighted `glmnet` multinomial with extended age features — **not** the plain baseline **M0**. Full ladder and exports live in `zilan/logistic_regression.Rmd` / `zilan/results/` (`cv_model_comparison.csv`, `metrics_summary.csv`). Foldable core below matches that M3 specification (α = 0.5, λ ≈ 0.026 via 1-SE); numbers in §7 are read from those CSVs.
 
+```{r fit-multinomial, eval=FALSE}
+# Core of zilan M3 (comparison row). Full grid M0–M3: zilan/logistic_regression.Rmd
+library(nnet); library(glmnet); library(splines); library(dplyr)
+
+classes <- levels(y_train)
+class_weights <- function(y) {
+  w <- length(y) / (length(levels(y)) * as.numeric(table(y)))
+  setNames(w, levels(y))[as.character(y)]
+}
+ref_levels <- function(x) {
+  fixed <- c(Type = "Cat", Sex = "Female", has_pattern = "Pure", has_Name = "0")
+  sapply(names(Filter(is.factor, x)), function(v) {
+    if (v %in% names(fixed)) fixed[[v]] else names(which.max(table(x[[v]])))
+  })
+}
+# Extended age design used by M3 (not M0's linear age_z only).
+build_design_m3 <- function(xtr, xnew, miss_tr, miss_new) {
+  refs <- ref_levels(xtr)
+  prep <- function(x) {
+    for (v in names(refs))
+      x[[v]] <- relevel(factor(x[[v]], levels = levels(xtr[[v]])), refs[[v]])
+    x[, setdiff(names(x), "Age_Years_imputed"), drop = FALSE]
+  }
+  Xtr <- model.matrix(~ ., prep(xtr))[, -1, drop = FALSE]
+  Xnew <- model.matrix(~ ., prep(xnew))[, -1, drop = FALSE]
+  la_tr <- log1p(xtr$Age_Years_imputed); la_new <- log1p(xnew$Age_Years_imputed)
+  basis <- ns(la_tr, df = 3)
+  B_tr <- unclass(basis); B_new <- predict(basis, la_new)
+  colnames(B_tr) <- colnames(B_new) <- paste0("age_ns", 1:3)
+  lm_ <- mean(la_tr); ls_ <- sd(la_tr)
+  Xtr <- cbind(Xtr, B_tr,
+               dog_x_logage = (xtr$Type == "Dog") * (la_tr - lm_) / ls_,
+               age_missing = as.numeric(miss_tr))
+  Xnew <- cbind(Xnew, B_new,
+                dog_x_logage = (xnew$Type == "Dog") * (la_new - lm_) / ls_,
+                age_missing = as.numeric(miss_new))
+  colnames(Xtr) <- colnames(Xnew) <- make.names(colnames(Xtr))
+  keep <- apply(Xtr, 2, function(z) length(unique(z)) > 1)
+  list(Xtr = Xtr[, keep, drop = FALSE], Xnew = Xnew[, keep, drop = FALSE])
+}
+
+# Tuned 1-SE hyperparameters for M3 on the shared folds (see zilan/results).
+m3_alpha <- 0.5
+m3_lambda <- 0.02598484
+
+miss_train <- is.na(train_raw$Age_Years)  # requires train_raw from zilan prep
+fold_miss <- lapply(seq_along(cv_folds), function(k) list(
+  tr = miss_train[-cv_folds[[k]]], va = miss_train[cv_folds[[k]]]))
+
+fold_macro <- numeric(length(cv_data))
+for (k in seq_along(cv_data)) {
+  d <- cv_data[[k]]
+  des <- build_design_m3(d$x_train, d$x_valid, fold_miss[[k]]$tr, fold_miss[[k]]$va)
+  fit <- glmnet(des$Xtr, d$y_train, family = "multinomial",
+                type.multinomial = "grouped", alpha = m3_alpha,
+                weights = class_weights(d$y_train), lambda = m3_lambda)
+  pred <- as.character(predict(fit, des$Xnew, type = "class")[, 1])
+  # Macro-F1 on this fold (same definition as zilan class_metrics).
+  cm <- table(factor(d$y_valid, levels = classes), factor(pred, levels = classes))
+  f1 <- sapply(classes, function(cl) {
+    tp <- cm[cl, cl]; support <- sum(cm[cl, ]); pred_n <- sum(cm[, cl])
+    ifelse(support + pred_n > 0, 2 * tp / (support + pred_n), 0)
+  })
+  fold_macro[k] <- mean(f1)
+}
+# Expect mean ≈ 0.441 (matches zilan/results/cv_model_comparison.csv M3 row).
+mean(fold_macro); sd(fold_macro)
 ```
 
 ### Gradient Boosting (XGBoost)
@@ -1157,12 +1224,16 @@ for (k in 1:5) {
 3.  **Class imbalance:** Imbalance will be handled by passing per-observation weight values (inverse class frequency) into `xgb.DMatrix`, so that the rare Euthanasia and Other classes contribute proportionally more to the training loss than their raw counts would suggest.
 4.  **Evaluation:** Evaluated via shared outcome-stratified CV using macro-F1, balanced accuracy, and per-class recall. XGBoost's feature importance will be interpreted alongside correlated predictors and validation results; it does not establish an independent or causal contribution.
 
+**Final comparison protocol (Section 7):** ranking macro-F1 and per-class recall come from **one** OOF pass of the selected hyperparameters with early stopping (max 250 rounds, `early_stopping_rounds = 20`). On xgboost 3.x, use `evals=` (not `watchlist=`) and read `attr(bst, "early_stop")$best_iteration` — `bst$best_iteration` is NA and must not trigger a fixed-100-round fallback. Reproducible driver: `model_comparison/run_xgb_cv.R`; protocol note: `model_comparison/results/xgb_protocol.txt`.
+
 ```{r fit-xgboost, eval=FALSE, warning=FALSE, message=FALSE}
 library(xgboost)
 library(caret)
 library(dplyr)
 
-# 2. define Macro-F1 function
+outcome_levels <- levels(y_train)
+n_classes <- length(outcome_levels)
+
 calc_macro_f1 <- function(actual, predicted, classes) {
   f1s <- sapply(classes, function(cl) {
     tp <- sum(actual == cl & predicted == cl)
@@ -1175,150 +1246,93 @@ calc_macro_f1 <- function(actual, predicted, classes) {
   mean(f1s, na.rm = TRUE)
 }
 
-# 3. baseline model for 5-Fold CV
-baseline_cv_f1 <- numeric(5)
-
-for (k in 1:5) {
-  # kth fold
-  fold_xtrain <- cv_data[[k]]$x_train
-  fold_ytrain <- cv_data[[k]]$y_train
-  fold_xvalid <- cv_data[[k]]$x_valid
-  fold_yvalid <- cv_data[[k]]$y_valid
-  
-  # train kth data
-  dmy <- dummyVars(~ ., data = fold_xtrain, fullRank = FALSE)
-  m_train <- predict(dmy, newdata = fold_xtrain)
-  m_valid <- predict(dmy, newdata = fold_xvalid)
-  
-  # convert to 0-indexed labels (XGBoost)
-  lbl_train <- as.integer(fold_ytrain) - 1
-  lbl_valid <- as.integer(fold_yvalid) - 1
-  
-  dtrain <- xgb.DMatrix(data = m_train, label = lbl_train)
-  dvalid <- xgb.DMatrix(data = m_valid, label = lbl_valid)
-  
-  # Baseline 
-  base_params <- list(
-    booster     = "gbtree",
-    objective   = "multi:softprob",
-    num_class   = n_classes,
-    eval_metric = "mlogloss",
-    max_depth   = 6,
-    eta         = 0.3
-  )
-  
-  bst_base <- xgb.train(
-    params  = base_params,
-    data    = dtrain,
-    nrounds = 100,
-    verbose = 0
-  )
-  
-  # predict and calculate the fold's Macro-F1
-  probs <- predict(bst_base, dvalid, reshape = TRUE)
-  preds <- max.col(probs) - 1
-  pred_factor <- factor(outcome_levels[preds + 1], levels = outcome_levels)
-  
-  baseline_cv_f1[k] <- calc_macro_f1(fold_yvalid, pred_factor, outcome_levels)
+# xgboost 3.x: best iteration lives on the early_stop attribute.
+xgb_best_iteration <- function(bst) {
+  es <- attr(bst, "early_stop")
+  if (!is.null(es) && !is.null(es$best_iteration) && is.finite(es$best_iteration))
+    return(as.integer(es$best_iteration))
+  if (!is.null(bst$best_iteration) && is.finite(bst$best_iteration))
+    return(as.integer(bst$best_iteration))
+  NA_integer_
 }
 
-cat(sprintf("Baseline XGBoost 5-Fold CV Macro-F1: %.4f (± %.4f)\n", 
+# Baseline: fixed 100 rounds (no early stopping).
+baseline_cv_f1 <- numeric(5)
+for (k in 1:5) {
+  fold <- cv_data[[k]]
+  dmy <- dummyVars(~ ., data = fold$x_train, fullRank = FALSE)
+  m_train <- as.matrix(predict(dmy, newdata = fold$x_train))
+  m_valid <- as.matrix(predict(dmy, newdata = fold$x_valid))
+  dtrain <- xgb.DMatrix(data = m_train, label = as.integer(fold$y_train) - 1L)
+  dvalid <- xgb.DMatrix(data = m_valid, label = as.integer(fold$y_valid) - 1L)
+  bst_base <- xgb.train(
+    params = list(booster = "gbtree", objective = "multi:softprob",
+                  num_class = n_classes, eval_metric = "mlogloss",
+                  max_depth = 6, eta = 0.3),
+    data = dtrain, nrounds = 100, verbose = 0
+  )
+  probs <- matrix(predict(bst_base, dvalid), ncol = n_classes, byrow = FALSE)
+  pred_factor <- factor(outcome_levels[max.col(probs)], levels = outcome_levels)
+  baseline_cv_f1[k] <- calc_macro_f1(fold$y_valid, pred_factor, outcome_levels)
+}
+cat(sprintf("Baseline XGBoost 5-Fold CV Macro-F1: %.4f (± %.4f)\n",
             mean(baseline_cv_f1), sd(baseline_cv_f1)))
 ```
 
 ```{r fit-xgboost-tuned, eval=FALSE, warning=FALSE, message=FALSE}
+# Weighted + grid search; early stopping via evals= (xgboost 3.x API).
+# After selecting hyper-parameters, ONE OOF pass of the winner supplies both
+# ranking macro-F1 and per-class recall (see model_comparison/run_xgb_cv.R).
 
-# ==============================================================================
-# Model Improvement: Cost-Sensitive + Grid Search
-# ==============================================================================
-
-# hyperparameters
 tuning_grid <- expand.grid(
-  max_depth        = c(4, 6),
-  eta              = c(0.05, 0.10),
-  subsample        = c(0.80),
-  colsample_bytree = c(0.70, 0.85),
-  min_child_weight = c(1, 3)
+  max_depth = c(4, 6), eta = c(0.05, 0.10), subsample = 0.80,
+  colsample_bytree = c(0.70, 0.85), min_child_weight = c(1, 3)
 )
-
 best_macro_f1 <- -Inf
-best_config   <- NULL
-config_results <- numeric(nrow(tuning_grid))
+best_config <- NULL
 
-cat(sprintf("Evaluating %d th hyperparameter (5-Fold CV)...\n", nrow(tuning_grid)))
-
-for (cfg in 1:nrow(tuning_grid)) {
+for (cfg in seq_len(nrow(tuning_grid))) {
   current_params <- tuning_grid[cfg, ]
   fold_f1s <- numeric(5)
-  
   for (k in 1:5) {
-    fold_xtrain <- cv_data[[k]]$x_train
-    fold_ytrain <- cv_data[[k]]$y_train
-    fold_xvalid <- cv_data[[k]]$x_valid
-    fold_yvalid <- cv_data[[k]]$y_valid
-    
-    dmy <- dummyVars(~ ., data = fold_xtrain, fullRank = FALSE)
-    m_train <- predict(dmy, newdata = fold_xtrain)
-    m_valid <- predict(dmy, newdata = fold_xvalid)
-    
-    lbl_train <- as.integer(fold_ytrain) - 1
-    lbl_valid <- as.integer(fold_yvalid) - 1
-    
-    # calculate the weight of each category in each Fold
-    class_counts <- table(fold_ytrain)
-    weights_per_class <- nrow(fold_xtrain) / (length(class_counts) * class_counts)
-    sample_weights <- as.numeric(weights_per_class[as.character(fold_ytrain)])
-    
-    dtrain <- xgb.DMatrix(data = m_train, label = lbl_train, weight = sample_weights)
-    dvalid <- xgb.DMatrix(data = m_valid, label = lbl_valid)
-    
-    model_params <- list(
-      booster          = "gbtree",
-      objective        = "multi:softprob",
-      num_class        = n_classes,
-      eval_metric      = "mlogloss",
-      max_depth        = current_params$max_depth,
-      eta              = current_params$eta,
-      subsample        = current_params$subsample,
-      colsample_bytree = current_params$colsample_bytree,
-      min_child_weight = current_params$min_child_weight
-    )
-    
+    fold <- cv_data[[k]]
+    dmy <- dummyVars(~ ., data = fold$x_train, fullRank = FALSE)
+    m_train <- as.matrix(predict(dmy, newdata = fold$x_train))
+    m_valid <- as.matrix(predict(dmy, newdata = fold$x_valid))
+    class_counts <- table(fold$y_train)
+    weights_per_class <- nrow(fold$x_train) / (length(class_counts) * class_counts)
+    sample_weights <- as.numeric(weights_per_class[as.character(fold$y_train)])
+    dtrain <- xgb.DMatrix(data = m_train, label = as.integer(fold$y_train) - 1L,
+                          weight = sample_weights)
+    dvalid <- xgb.DMatrix(data = m_valid, label = as.integer(fold$y_valid) - 1L)
     bst_tuned <- xgb.train(
-      params                = model_params,
-      data                  = dtrain,
-      nrounds               = 250,
-      watchlist             = list(eval = dvalid),
-      early_stopping_rounds = 20,
-      verbose               = 0
+      params = list(
+        booster = "gbtree", objective = "multi:softprob",
+        num_class = n_classes, eval_metric = "mlogloss",
+        max_depth = current_params$max_depth, eta = current_params$eta,
+        subsample = current_params$subsample,
+        colsample_bytree = current_params$colsample_bytree,
+        min_child_weight = current_params$min_child_weight
+      ),
+      data = dtrain, nrounds = 250,
+      evals = list(eval = dvalid),          # not watchlist= on xgboost 3.x
+      early_stopping_rounds = 20, verbose = 0
     )
-    
-    probs <- predict(bst_tuned, dvalid, reshape = TRUE)
-    preds <- max.col(probs) - 1
-    pred_factor <- factor(outcome_levels[preds + 1], levels = outcome_levels)
-    
-    fold_f1s[k] <- calc_macro_f1(fold_yvalid, pred_factor, outcome_levels)
+    stopifnot(!is.na(xgb_best_iteration(bst_tuned)))
+    probs <- matrix(predict(bst_tuned, dvalid), ncol = n_classes, byrow = FALSE)
+    pred_factor <- factor(outcome_levels[max.col(probs)], levels = outcome_levels)
+    fold_f1s[k] <- calc_macro_f1(fold$y_valid, pred_factor, outcome_levels)
   }
-  
-  mean_f1 <- mean(fold_f1s)
-  config_results[cfg] <- mean_f1
-  
-  if (mean_f1 > best_macro_f1) {
-    best_macro_f1 <- mean_f1
-    best_config   <- current_params
+  if (mean(fold_f1s) > best_macro_f1) {
+    best_macro_f1 <- mean(fold_f1s)
+    best_config <- current_params
   }
 }
-
-# 2. result
-cat("\n=======================================================\n")
-cat("                 CV For Tuning (XGBoost)               \n")
-cat("=======================================================\n")
 cat(sprintf("Baseline CV Macro-F1  : %.4f\n", mean(baseline_cv_f1)))
 cat(sprintf("Weighted CV Macro-F1  : %.4f\n", best_macro_f1))
-cat(sprintf("Macro-F1 Difference            : +%.4f\n", best_macro_f1 - mean(baseline_cv_f1)))
-cat("\nBest Parameter:\n")
 print(best_config)
-
+# Selected config used in §7: max_depth=6, eta=0.1, colsample=0.85, min_child=1
+# Unified OOF mean CV macro-F1 ≈ 0.4865 (mean best_nrounds ≈ 184).
 ```
 ### Random Forest
 
@@ -1368,8 +1382,66 @@ knitr::kable(rf_baseline_results, digits = 4)
 3.  **Class imbalance:** Class weights based on inverse outcome frequency will be considered during training so that rare classes, particularly Euthanasia and Other, have greater influence on the decision boundary rather than being dominated by the majority Adoption class.
 4.  **Evaluation:** Follow the shared outcome-stratified cross-validation plan, using macro-F1 as the primary evaluation metric together with balanced accuracy, per-class recall, and a confusion matrix. The RBF SVM will be compared with Multinomial Logistic Regression, XGBoost, Random Forest, and the remaining model using the same validation splits and evaluation measures.
 
-```{r fit-svm, eval=FALSE}
+**Comparison model (Section 7):** selected RBF SVM is **C = 10**, **γ = 4/p**, **unweighted** (highest mean CV macro-F1 among 18 candidates). Full grid, encoder, and exports: `SVM_week12/svm_model.R` → `SVM_week12/svm_results/` (copied into `model_comparison/results/` for the bake-off). Foldable core below is the selected configuration on the shared folds.
 
+```{r fit-svm, eval=FALSE}
+# Selected SVM only (C=10, gamma=4/p, no class weights). Full grid: SVM_week12/svm_model.R
+library(e1071)
+
+svm_fit_encoder <- function(x) {
+  x <- as.data.frame(x)
+  age <- "Age_Years_imputed"
+  categorical <- setdiff(names(x), age)
+  encoder <- list(
+    predictors = names(x), age = age, categorical = categorical,
+    levels = lapply(x[categorical], function(z) sort(unique(as.character(z)))),
+    age_mean = mean(x[[age]]), age_sd = sd(x[[age]]), keep = NULL
+  )
+  if (!is.finite(encoder$age_sd) || encoder$age_sd == 0) encoder$age_sd <- 1
+  enc <- svm_apply_encoder(encoder, x)
+  encoder$keep <- apply(enc, 2, function(z) length(unique(z)) > 1L)
+  encoder
+}
+svm_apply_encoder <- function(encoder, x) {
+  x <- as.data.frame(x)[encoder$predictors]
+  blocks <- lapply(encoder$categorical, function(variable) {
+    value <- as.character(x[[variable]])
+    lev <- encoder$levels[[variable]]
+    mat <- matrix(vapply(lev, function(z) as.numeric(!is.na(value) & value == z),
+                         numeric(nrow(x))), nrow = nrow(x))
+    colnames(mat) <- paste(variable, lev, sep = "=")
+    mat
+  })
+  encoded <- do.call(cbind, c(blocks, list(
+    Age_Years_imputed = (x[[encoder$age]] - encoder$age_mean) / encoder$age_sd)))
+  if (!is.null(encoder$keep)) encoded <- encoded[, encoder$keep, drop = FALSE]
+  encoded
+}
+
+# Selected by CV macro-F1 (SVM_week12/svm_results/baseline_vs_selected.csv).
+sel_C <- 10; sel_gamma_mult <- 4; classes <- levels(y_train)
+fold_macro <- numeric(length(cv_data))
+for (k in seq_along(cv_data)) {
+  fold <- cv_data[[k]]
+  enc <- svm_fit_encoder(fold$x_train)
+  xtr <- svm_apply_encoder(enc, fold$x_train)
+  xva <- svm_apply_encoder(enc, fold$x_valid)
+  fit <- e1071::svm(
+    x = xtr, y = fold$y_train, type = "C-classification", kernel = "radial",
+    cost = sel_C, gamma = sel_gamma_mult / ncol(xtr), scale = FALSE,
+    probability = FALSE, fitted = FALSE
+  )
+  pred <- predict(fit, xva)
+  cm <- table(factor(fold$y_valid, levels = classes),
+              factor(pred, levels = classes))
+  f1 <- sapply(classes, function(cl) {
+    tp <- cm[cl, cl]; support <- sum(cm[cl, ]); pred_n <- sum(cm[, cl])
+    ifelse(support + pred_n > 0, 2 * tp / (support + pred_n), 0)
+  })
+  fold_macro[k] <- mean(f1)
+}
+# Expect mean ≈ 0.456 (matches model_comparison/results SVM selected row).
+mean(fold_macro); sd(fold_macro)
 ```
 
 ### Decision Tree
@@ -1450,7 +1522,8 @@ knitr::kable(rf_cv_summary, digits = 4,
 1. **Data split.** Shared stratified ~80/20 split of latest-intake records (`seed = 5003`). The 20% holdout is reserved for a single final test after model selection.
 2. **Validation.** All compared models use the same outcome-stratified 5-fold CV objects in `cv_data`, with imputation, breed grouping and factor alignment learned from each fold's training rows only.
 3. **Metrics.** **Macro-F1** is primary (unweighted mean of the five class F1 scores) because Adoption dominates the label distribution. **Balanced accuracy** is the mean of per-class recall. Overall accuracy is secondary. Metric definitions align with the SVM contribution notes: balanced accuracy here is macro-averaged recall, not mean one-vs-rest (sensitivity+specificity)/2.
-4. **Coverage note (five-model plan).** The group planned five classifiers. **Four** now have exported numeric CV results under the shared split (XGBoost, random forest, SVM, logistic). **Decision tree** is still only a planned stub and is shown as not uploaded rather than invented.
+4. **Coverage note (five-model plan).** The group planned five classifiers. **Four** now have exported numeric CV results under the shared split (XGBoost, random forest, SVM, logistic **M3**). **Decision tree** is still only a planned stub and is shown as not uploaded rather than invented.
+5. **XGBoost protocol.** Ranking macro-F1 and per-class recall for XGBoost are from the **same** OOF pass under early stopping (max 250 rounds, stop after 20 non-improving rounds; `attr(bst,"early_stop")$best_iteration`). They are not mixed with a fixed-100-round export.
 
 ### Cross-validated comparison
 
@@ -1493,7 +1566,7 @@ cv_display <- cv_compare %>%
 
 kable(
   cv_display,
-  caption = "Shared-fold comparison. Macro-F1 is the selection metric. Pending rows are not scored yet."
+  caption = "Shared-fold comparison. Macro-F1 is the selection metric. Logistic row is M3 (improved), not baseline M0. Pending rows are not scored yet."
 )
 
 # Build plot data from Compared rows (include every scored model, incl. XGBoost).
@@ -1507,7 +1580,8 @@ cv_plot_df <- cv_compare %>%
       grepl("^XGBoost", Model_full) ~ "XGBoost",
       grepl("^Random Forest", Model_full) ~ "Random Forest",
       grepl("^RBF SVM", Model_full) ~ "RBF SVM",
-      grepl("^Multinomial logistic", Model_full) ~ "Logistic",
+      grepl("logistic.*M3|M3 \\(improved\\)", Model_full) ~ "Logistic M3",
+      grepl("^Multinomial logistic", Model_full) ~ "Logistic M3",
       TRUE ~ Model_full
     ),
     Model = factor(Model, levels = unique(Model))
@@ -1515,6 +1589,7 @@ cv_plot_df <- cv_compare %>%
 
 stopifnot(
   any(cv_plot_df$Model == "XGBoost"),
+  any(cv_plot_df$Model == "Logistic M3"),
   nrow(cv_plot_df) >= 4
 )
 
@@ -1531,7 +1606,7 @@ p_macro <- ggplot(cv_plot_df, aes(x = Model, y = Mean_CV_Macro_F1)) +
   scale_x_discrete(drop = FALSE) +
   scale_y_continuous(limits = c(0, 0.65), expand = expansion(mult = c(0, 0.08))) +
   labs(
-    title = "Primary metric: mean CV macro-F1 (incl. XGBoost)",
+    title = "Primary metric: mean CV macro-F1 (XGBoost unified OOF)",
     x = NULL, y = "Macro-F1"
   ) +
   theme_minimal(base_size = 9) +
@@ -1547,7 +1622,8 @@ recall_long <- recall_compare %>%
       grepl("^XGBoost", Model) ~ "XGBoost",
       grepl("^Random Forest", Model) ~ "Random Forest",
       grepl("^RBF SVM", Model) ~ "RBF SVM",
-      grepl("^Multinomial logistic", Model) ~ "Logistic",
+      grepl("logistic.*M3|M3 \\(improved\\)", Model) ~ "Logistic M3",
+      grepl("^Multinomial logistic", Model) ~ "Logistic M3",
       TRUE ~ Model
     )
   ) %>%
@@ -1565,13 +1641,16 @@ recall_long <- recall_compare %>%
     Model = factor(Model, levels = recall_levels)
   )
 
-stopifnot(any(recall_long$Model == "XGBoost", na.rm = TRUE))
+stopifnot(
+  any(recall_long$Model == "XGBoost", na.rm = TRUE),
+  any(recall_long$Model == "Logistic M3", na.rm = TRUE)
+)
 
 fill_cols <- c(
   "XGBoost" = "#4C78A8",
   "Random Forest" = "#59A14F",
   "RBF SVM" = "#F2A65A",
-  "Logistic" = "#B07AA1"
+  "Logistic M3" = "#B07AA1"
 )
 
 p_recall <- ggplot(recall_long, aes(x = Outcome, y = Recall, fill = Model)) +
@@ -1579,7 +1658,7 @@ p_recall <- ggplot(recall_long, aes(x = Outcome, y = Recall, fill = Model)) +
   scale_y_continuous(labels = percent_format(accuracy = 1), limits = c(0, 1)) +
   scale_fill_manual(values = fill_cols, drop = FALSE) +
   labs(
-    title = "Per-class recall (four scored models, incl. XGBoost)",
+    title = "Per-class recall (same XGB OOF as ranking; logistic = M3)",
     x = NULL, y = "Recall", fill = NULL
   ) +
   theme_minimal(base_size = 9) +
@@ -1593,37 +1672,37 @@ p_macro
 p_recall
 ```
 
-**How to read the metrics.** Macro-F1 rises only when precision and recall improve together across *all* five outcomes, so a model that predicts mostly Adoption can have high accuracy but low macro-F1. Balanced accuracy (mean recall) highlights whether rare Euthanasia/Other cases are found—the signal intake triage officers need. Accuracy alone is misleading here because the majority class already exceeds 50%.
+**How to read the metrics.** Macro-F1 rises only when precision and recall improve together across *all* five outcomes, so a model that predicts mostly Adoption can have high accuracy but low macro-F1. Balanced accuracy (mean recall) highlights whether rare Euthanasia/Other cases are found—the signal intake triage officers need. Accuracy alone is misleading here because the majority class already exceeds 50%. The logistic comparison row is **M3 (improved: inverse-frequency weights + extended age features)**, not plain **M0**.
 
 ### Strengths and weaknesses of the compared models
 
 | Model | Strengths | Weaknesses |
 |------|-----------|------------|
-| **XGBoost (weighted + tuned)** | **Highest mean CV macro-F1 (~0.489)**; best balanced accuracy among non-linear models (~0.54); stronger Euthanasia/Other recall than RF/SVM | Slightly lower overall accuracy than RF/SVM; less directly interpretable than logistic coefficients |
+| **XGBoost (weighted + tuned)** | **Highest mean CV macro-F1 (0.486 ± 0.014)** on the unified OOF pass; best balanced accuracy among non-linear models (~0.54); stronger Euthanasia/Other recall than RF/SVM | Slightly lower overall accuracy than RF/SVM; less directly interpretable than logistic coefficients |
 | **Random Forest (selected)** | Strong macro-F1 (~0.484); high Adoption/Transfer recall; stable across the Daun `num.trees`/`mtry` grid | Minority recall still poor (Euthanasia ~0.08) |
 | **RBF SVM (selected)** | Competitive macro-F1 (~0.456); strong Adoption/Transfer recall | Very weak Euthanasia recall (~0.05); holdout unused |
-| **Multinomial logistic (M3)** | Strong Return/Other recall; interpretable odds ratios; published holdout close to CV | Lowest macro-F1 (~0.441) among the four scored models |
+| **Multinomial logistic M3 (improved)** | Strong Return/Other recall; interpretable odds ratios; published holdout close to CV. **Not M0** (M0 macro-F1 ≈ 0.368) | Lowest macro-F1 (~0.441) among the four scored models |
 | **Decision Tree** | Planned interpretable non-linear baseline | Not uploaded—five-model plan incomplete |
 
-Artefacts live under `model_comparison/results/` (logistic from `zilan/`; SVM from `SVM_week12/`; RF via `run_rf_cv.R`; XGBoost via `run_xgb_cv.R` using Janet's weighting/tuning design on the shared folds).
+Artefacts live under `model_comparison/results/` (logistic **M3** from `zilan/`; SVM from `SVM_week12/`; RF via `run_rf_cv.R`; XGBoost via `run_xgb_cv.R` with unified early-stopping OOF).
 
 ### Final model selection
 
-**Selected model (on scored CV):** **XGBoost** with inverse-frequency class weights and CV-chosen hyperparameters (`max_depth = 6`, `eta = 0.1`, `subsample = 0.8`, `colsample_bytree = 0.85`, `min_child_weight = 1`), because it has the highest mean CV macro-F1 (**0.489 ± 0.014**) under the shared protocol—narrowly ahead of Random Forest (0.484 ± 0.016)—and also improves balanced accuracy (~0.54) and rare-class recall relative to RF/SVM.
+**Selected model (on scored CV):** **XGBoost** with inverse-frequency class weights and CV-chosen hyperparameters (`max_depth = 6`, `eta = 0.1`, `subsample = 0.8`, `colsample_bytree = 0.85`, `min_child_weight = 1`; mean `best_nrounds` ≈ 184 under early stopping), because it has the highest mean CV macro-F1 (**0.486 ± 0.014**) under the **unified** ranking+recall protocol—narrowly ahead of Random Forest (0.484 ± 0.016)—and also improves balanced accuracy (~0.54) and rare-class recall relative to RF/SVM.
 
-**Stakeholder note.** For intake triage, XGBoost's Euthanasia recall (~0.30) and Other recall (~0.46) are closer to the weighted logistic profile than RF/SVM, while still leading on the primary macro-F1 metric. The decision tree remains outstanding before a fully five-model bake-off.
+**Stakeholder note.** For intake triage, XGBoost's Euthanasia recall (~0.31) and Other recall (~0.43) from the same OOF pass are closer to the **logistic M3** profile than RF/SVM, while still leading on the primary macro-F1 metric. The decision tree remains outstanding before a fully five-model bake-off.
 
-**Holdout.** Only the logistic contribution has published a one-shot held-out test (macro-F1 ≈ 0.441). SVM, RF and XGBoost left `x_test`/`y_test` unused during tuning. After the decision tree is scored—or if the group freezes the four-model set—the selected model should be **refit once on the full training set and evaluated once on the holdout**.
+**Holdout.** Only the logistic **M3** contribution has published a one-shot held-out test (macro-F1 ≈ 0.441). SVM, RF and XGBoost left `x_test`/`y_test` unused during tuning. After the decision tree is scored—or if the group freezes the four-model set—the selected model should be **refit once on the full training set and evaluated once on the holdout**.
 
 ### DIP reflection and improvements
 
-**What worked.** Shared preprocessing, a single seed, and common `cv_data` folds made member contributions comparable without re-splitting. Exporting a common CV summary schema (`model_comparison/results/`) let XGBoost, RF, SVM and logistic enter the same table. Primary use of macro-F1 with balanced accuracy and per-class recall matched the imbalanced multi-class problem and stakeholder needs better than accuracy.
+**What worked.** Shared preprocessing, a single seed, and common `cv_data` folds made member contributions comparable without re-splitting. Exporting a common CV summary schema (`model_comparison/results/`) let XGBoost, RF, SVM and logistic M3 enter the same table. Primary use of macro-F1 with balanced accuracy and per-class recall matched the imbalanced multi-class problem and stakeholder needs better than accuracy. Fixing xgboost 3.x early-stop attribution kept ranking and recall evidence on one final model.
 
 **What to improve next time.** (1) Freeze the results schema before members finish tuning. (2) Keep the outer holdout unused until *all* planned models finish. (3) Document class-weight tradeoffs in one place. (4) Complete the fifth model (decision tree). (5) Revisit whether `Spayed.Neutered` is fully available at intake (logistic sensitivity checks flagged leakage risk).
 
 ## 8. Final Results & Conclusion
 
-**Final results and interpretation.** Among the four models with exported shared-fold metrics, **XGBoost** leads on CV macro-F1 (~0.489), with Random Forest close behind (~0.484). Adoption and Transfer are predicted well by the tree ensembles and SVM; XGBoost and weighted logistic recover more of the rare Euthanasia/Other cases that matter for triage. The decision tree is still outstanding.
+**Final results and interpretation.** Among the four models with exported shared-fold metrics, **XGBoost** leads on unified-OOF CV macro-F1 (**0.486**), with Random Forest close behind (~0.484). Adoption and Transfer are predicted well by the tree ensembles and SVM; XGBoost and **logistic M3** recover more of the rare Euthanasia/Other cases that matter for triage. The decision tree is still outstanding.
 
 **Answer to the research question.** Intake-time characteristics of cats and dogs carry moderate predictive signal for the five consolidated outcomes: CV macro-F1 values around 0.44–0.49 clearly beat a majority-class baseline (~0.14) but leave substantial error on minority classes. Predictions can support prioritisation, not autonomous outcome determination.
 

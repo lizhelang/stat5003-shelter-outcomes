@@ -399,13 +399,18 @@ for (k in 1:5) {
 
 
 
-# ---- XGBoost CV (Janet-style grid on shared folds; read-only adaptation) ----
+# ---- XGBoost CV (Janet-style grid; unified ranking + OOF protocol) ----
+# Protocol (xgboost >= 2/3):
+# - Tuning: nrounds max 250, evals= validation fold, early_stopping_rounds=20.
+# - best_iteration from attr(bst, "early_stop")$best_iteration (NOT bst$best_iteration).
+# - After selecting hyper-parameters by mean fold macro-F1, ONE OOF pass of the
+#   selected config uses the same early-stopping rule; ranking metrics and
+#   per-class recall are computed from those same OOF predictions only.
 suppressPackageStartupMessages({
   library(xgboost)
   library(caret)
 })
 
-# Prefer user library if system lib lacks xgboost
 .libPaths(c(path.expand("~/R/library"), .libPaths()))
 if (!requireNamespace("xgboost", quietly = TRUE)) {
   stop("xgboost is not installed")
@@ -443,7 +448,58 @@ encode_fold <- function(x_train, x_valid) {
   list(m_train = m_train, m_valid = m_valid)
 }
 
-# Baseline (unweighted): max_depth=6, eta=0.3, nrounds=100
+xgb_best_iteration <- function(bst) {
+  es <- attr(bst, "early_stop")
+  if (!is.null(es) && !is.null(es$best_iteration) && is.finite(es$best_iteration)) {
+    return(as.integer(es$best_iteration))
+  }
+  if (!is.null(bst$best_iteration) && is.finite(bst$best_iteration)) {
+    return(as.integer(bst$best_iteration))
+  }
+  NA_integer_
+}
+
+xgb_predict_class <- function(bst, dvalid) {
+  probs <- predict(bst, dvalid)
+  if (is.null(dim(probs))) {
+    probs <- matrix(probs, ncol = n_classes, byrow = FALSE)
+  }
+  factor(outcome_levels[max.col(probs)], levels = outcome_levels)
+}
+
+fit_weighted_xgb_fold <- function(fold, params, max_nrounds = 250L, early_stop = 20L) {
+  enc <- encode_fold(fold$x_train, fold$x_valid)
+  lbl_train <- as.integer(fold$y_train) - 1L
+  class_counts <- table(fold$y_train)
+  weights_per_class <- nrow(fold$x_train) / (length(class_counts) * as.numeric(class_counts))
+  names(weights_per_class) <- names(class_counts)
+  sample_weights <- as.numeric(weights_per_class[as.character(fold$y_train)])
+  dtrain <- xgb.DMatrix(data = enc$m_train, label = lbl_train, weight = sample_weights)
+  dvalid <- xgb.DMatrix(data = enc$m_valid, label = as.integer(fold$y_valid) - 1L)
+  bst <- xgb.train(
+    params = c(
+      list(
+        booster = "gbtree", objective = "multi:softprob",
+        num_class = n_classes, eval_metric = "mlogloss"
+      ),
+      params
+    ),
+    data = dtrain,
+    nrounds = max_nrounds,
+    evals = list(eval = dvalid),
+    early_stopping_rounds = early_stop,
+    verbose = 0
+  )
+  preds <- xgb_predict_class(bst, dvalid)
+  list(
+    preds = preds,
+    best_nrounds = xgb_best_iteration(bst),
+    Macro_F1 = calc_macro_f1(fold$y_valid, preds),
+    Balanced_Accuracy = bal_acc(fold$y_valid, preds),
+    Accuracy = mean(preds == fold$y_valid)
+  )
+}
+
 baseline_fold <- data.frame()
 for (k in seq_along(cv_data)) {
   fold <- cv_data[[k]]
@@ -459,18 +515,17 @@ for (k in seq_along(cv_data)) {
     ),
     data = dtrain, nrounds = 100, verbose = 0
   )
-  probs <- matrix(predict(bst, dvalid), ncol = n_classes, byrow = FALSE)
-  preds <- factor(outcome_levels[max.col(probs)], levels = outcome_levels)
+  preds <- xgb_predict_class(bst, dvalid)
   baseline_fold <- rbind(baseline_fold, data.frame(
     Model = "XGBoost baseline", Fold = k,
     Macro_F1 = calc_macro_f1(fold$y_valid, preds),
     Balanced_Accuracy = bal_acc(fold$y_valid, preds),
-    Accuracy = mean(preds == fold$y_valid)
+    Accuracy = mean(preds == fold$y_valid),
+    best_nrounds = 100L
   ))
   cat(sprintf("baseline fold %d done\n", k))
 }
 
-# Weighted + tuned grid (Janet)
 tuning_grid <- expand.grid(
   max_depth = c(4, 6),
   eta = c(0.05, 0.10),
@@ -484,42 +539,28 @@ tuning_grid <- expand.grid(
 tune_fold <- data.frame()
 for (cfg in seq_len(nrow(tuning_grid))) {
   p <- tuning_grid[cfg, ]
+  params <- list(
+    max_depth = p$max_depth, eta = p$eta,
+    subsample = p$subsample, colsample_bytree = p$colsample_bytree,
+    min_child_weight = p$min_child_weight
+  )
   for (k in seq_along(cv_data)) {
-    fold <- cv_data[[k]]
-    enc <- encode_fold(fold$x_train, fold$x_valid)
-    lbl_train <- as.integer(fold$y_train) - 1L
-    class_counts <- table(fold$y_train)
-    weights_per_class <- nrow(fold$x_train) / (length(class_counts) * as.numeric(class_counts))
-    names(weights_per_class) <- names(class_counts)
-    sample_weights <- as.numeric(weights_per_class[as.character(fold$y_train)])
-    dtrain <- xgb.DMatrix(data = enc$m_train, label = lbl_train, weight = sample_weights)
-    dvalid <- xgb.DMatrix(data = enc$m_valid, label = as.integer(fold$y_valid) - 1L)
-    bst <- xgb.train(
-      params = list(
-        booster = "gbtree", objective = "multi:softprob",
-        num_class = n_classes, eval_metric = "mlogloss",
-        max_depth = p$max_depth, eta = p$eta,
-        subsample = p$subsample, colsample_bytree = p$colsample_bytree,
-        min_child_weight = p$min_child_weight
-      ),
-      data = dtrain, nrounds = 250,
-      watchlist = list(eval = dvalid),
-      early_stopping_rounds = 20,
-      verbose = 0
-    )
-    probs <- matrix(predict(bst, dvalid), ncol = n_classes, byrow = FALSE)
-    preds <- factor(outcome_levels[max.col(probs)], levels = outcome_levels)
+    fit <- fit_weighted_xgb_fold(cv_data[[k]], params)
     tune_fold <- rbind(tune_fold, data.frame(
       max_depth = p$max_depth, eta = p$eta, subsample = p$subsample,
       colsample_bytree = p$colsample_bytree, min_child_weight = p$min_child_weight,
       Fold = k,
-      Macro_F1 = calc_macro_f1(fold$y_valid, preds),
-      Balanced_Accuracy = bal_acc(fold$y_valid, preds),
-      Accuracy = mean(preds == fold$y_valid),
-      best_nrounds = if (!is.null(bst$best_iteration)) bst$best_iteration else NA_integer_
+      Macro_F1 = fit$Macro_F1,
+      Balanced_Accuracy = fit$Balanced_Accuracy,
+      Accuracy = fit$Accuracy,
+      best_nrounds = fit$best_nrounds
     ))
   }
   cat(sprintf("tune config %d/%d done\n", cfg, nrow(tuning_grid)))
+}
+
+if (anyNA(tune_fold$best_nrounds)) {
+  stop("best_nrounds still NA after early_stop fix; aborting to avoid mixed protocols")
 }
 
 tune_summary <- tune_fold %>%
@@ -529,6 +570,7 @@ tune_summary <- tune_fold %>%
     SD_Macro_F1 = sd(Macro_F1),
     Mean_Balanced_Accuracy = mean(Balanced_Accuracy),
     Mean_Accuracy = mean(Accuracy),
+    Mean_best_nrounds = mean(best_nrounds),
     .groups = "drop"
   ) %>%
   arrange(desc(Mean_Macro_F1))
@@ -547,42 +589,30 @@ write.csv(baseline_fold, "model_comparison/results/xgb_baseline_fold_scores.csv"
 write.csv(tune_fold, "model_comparison/results/xgb_cv_fold_scores.csv", row.names = FALSE)
 write.csv(tune_summary, "model_comparison/results/xgb_cv_summary.csv", row.names = FALSE)
 
-# OOF per-class for best config
+best_params <- list(
+  max_depth = best$max_depth, eta = best$eta,
+  subsample = best$subsample, colsample_bytree = best$colsample_bytree,
+  min_child_weight = best$min_child_weight
+)
+oof_fold <- data.frame()
 best_preds <- list(); best_actual <- list()
 for (k in seq_along(cv_data)) {
   fold <- cv_data[[k]]
-  enc <- encode_fold(fold$x_train, fold$x_valid)
-  lbl_train <- as.integer(fold$y_train) - 1L
-  class_counts <- table(fold$y_train)
-  weights_per_class <- nrow(fold$x_train) / (length(class_counts) * as.numeric(class_counts))
-  names(weights_per_class) <- names(class_counts)
-  sample_weights <- as.numeric(weights_per_class[as.character(fold$y_train)])
-  dtrain <- xgb.DMatrix(data = enc$m_train, label = lbl_train, weight = sample_weights)
-  dvalid <- xgb.DMatrix(data = enc$m_valid)
-  # use mean best_nrounds across folds for that config, fallback 100
-  fold_rows <- tune_fold %>%
-    filter(
-      max_depth == best$max_depth, eta == best$eta,
-      colsample_bytree == best$colsample_bytree,
-      min_child_weight == best$min_child_weight
-    )
-  nrounds_use <- suppressWarnings(as.integer(round(mean(fold_rows$best_nrounds, na.rm = TRUE))))
-  if (is.na(nrounds_use) || nrounds_use < 1) nrounds_use <- 100L
-  bst <- xgb.train(
-    params = list(
-      booster = "gbtree", objective = "multi:softprob",
-      num_class = n_classes, eval_metric = "mlogloss",
-      max_depth = best$max_depth, eta = best$eta,
-      subsample = best$subsample, colsample_bytree = best$colsample_bytree,
-      min_child_weight = best$min_child_weight
-    ),
-    data = dtrain, nrounds = nrounds_use, verbose = 0
-  )
-  probs <- matrix(predict(bst, dvalid), ncol = n_classes, byrow = FALSE)
-  preds <- factor(outcome_levels[max.col(probs)], levels = outcome_levels)
-  best_preds[[k]] <- preds
+  fit <- fit_weighted_xgb_fold(fold, best_params)
+  best_preds[[k]] <- fit$preds
   best_actual[[k]] <- fold$y_valid
+  oof_fold <- rbind(oof_fold, data.frame(
+    Fold = k,
+    Macro_F1 = fit$Macro_F1,
+    Balanced_Accuracy = fit$Balanced_Accuracy,
+    Accuracy = fit$Accuracy,
+    best_nrounds = fit$best_nrounds
+  ))
+  cat(sprintf("selected OOF fold %d: macro-F1=%.4f nrounds=%d\n",
+              k, fit$Macro_F1, fit$best_nrounds))
 }
+write.csv(oof_fold, "model_comparison/results/xgb_selected_oof_fold_scores.csv", row.names = FALSE)
+
 actual <- factor(unlist(best_actual), levels = outcome_levels)
 predicted <- factor(unlist(best_preds), levels = outcome_levels)
 per_class <- bind_rows(lapply(outcome_levels, function(cl) {
@@ -601,21 +631,37 @@ selected <- data.frame(
   Macro_F1_pooled_oof = mean(per_class$F1),
   Balanced_Accuracy_pooled_oof = mean(per_class$Recall),
   Accuracy_pooled_oof = mean(actual == predicted),
-  Mean_CV_Macro_F1 = best$Mean_Macro_F1,
-  SD_CV_Macro_F1 = best$SD_Macro_F1,
-  Mean_CV_Balanced_Accuracy = best$Mean_Balanced_Accuracy,
-  Mean_CV_Accuracy = best$Mean_Accuracy,
-  Baseline_Mean_CV_Macro_F1 = baseline_summary$Mean_Macro_F1,
-  Baseline_SD_CV_Macro_F1 = baseline_summary$SD_Macro_F1,
-  max_depth = best$max_depth,
-  eta = best$eta,
-  subsample = best$subsample,
-  colsample_bytree = best$colsample_bytree,
-  min_child_weight = best$min_child_weight
+  Mean_CV_Macro_F1 = mean(oof_fold$Macro_F1),
+  SD_CV_Macro_F1 = sd(oof_fold$Macro_F1),
+  Mean_CV_Balanced_Accuracy = mean(oof_fold$Balanced_Accuracy),
+  Mean_CV_Accuracy = mean(oof_fold$Accuracy),
+  Mean_best_nrounds = mean(oof_fold$best_nrounds),
+  Baseline_Mean_CV_Macro_F1 = baseline_summary$Mean_Macro_F1[[1]],
+  Baseline_SD_CV_Macro_F1 = baseline_summary$SD_Macro_F1[[1]],
+  Tuning_Mean_CV_Macro_F1 = as.numeric(best$Mean_Macro_F1)[1],
+  Tuning_SD_CV_Macro_F1 = as.numeric(best$SD_Macro_F1)[1],
+  max_depth = as.numeric(best$max_depth)[1],
+  eta = as.numeric(best$eta)[1],
+  subsample = as.numeric(best$subsample)[1],
+  colsample_bytree = as.numeric(best$colsample_bytree)[1],
+  min_child_weight = as.numeric(best$min_child_weight)[1],
+  Protocol = "weighted; max 250 rounds; early_stopping_rounds=20; ranking+recall from same OOF pass",
+  stringsAsFactors = FALSE
 )
 write.csv(selected, "model_comparison/results/xgb_selected_metrics.csv", row.names = FALSE)
+writeLines(
+  c(
+    "XGBoost comparison protocol",
+    "Tuning grid selects hyper-parameters by mean fold macro-F1 under early stopping.",
+    "Reported ranking macro-F1 / balanced accuracy / per-class recall all come from one",
+    "subsequent OOF pass of the selected hyper-parameters with the same early-stopping rule.",
+    "best_nrounds is attr(bst, 'early_stop')$best_iteration (xgboost 3.x)."
+  ),
+  "model_comparison/results/xgb_protocol.txt"
+)
 print(baseline_summary)
 print(head(tune_summary, 5))
 print(selected)
 print(per_class)
-cat("XGBoost CV complete.\n")
+print(oof_fold)
+cat("XGBoost CV complete (unified OOF).\n")

@@ -1,6 +1,6 @@
 Model,Status,Source,Mean_CV_Macro_F1,SD_CV_Macro_F1,Mean_CV_Balanced_Accuracy,Mean_CV_Accuracy,Notes
-XGBoost (weighted + tuned),Compared,model_comparison/results (Janet grid on shared folds),0.4889,0.0141,0.5374,0.6950,"max_depth=6 eta=0.1 subsample=0.8 colsample=0.85 min_child_weight=1; inverse-frequency weights"
+XGBoost (weighted + tuned),Compared,model_comparison/results (unified OOF; Janet grid on shared folds),0.4865,0.0136,0.5357,0.6937,"max_depth=6 eta=0.1 subsample=0.8 colsample=0.85 min_child_weight=1; inverse-frequency weights; max 250 rounds early_stopping=20; ranking+recall from same OOF (mean best_nrounds≈184)"
 Random Forest (selected),Compared,model_comparison/results (Daun grid on shared folds),0.4836,0.0155,0.4617,0.7997,num.trees=500 mtry=4
 RBF SVM (selected),Compared,SVM_week12/svm_results,0.4555,0.0123,0.4400,0.8000,C=10 gamma=4/p unweighted; holdout not scored
-Multinomial logistic (glmnet M3),Compared,zilan/results,0.4413,0.0124,0.5215,0.6238,Inverse-frequency weights + age features; shared seed/folds
+Multinomial logistic M3 (improved),Compared,zilan/results,0.4413,0.0124,0.5215,0.6238,"M3 = glmnet multinomial + inverse-frequency weights + extended age features (not baseline M0); alpha=0.5 lambda≈0.026 (1-SE)"
 Decision Tree,Not uploaded,planned fifth model,NA,NA,NA,NA,Section stub only; no branch results yet
