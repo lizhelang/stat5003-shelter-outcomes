@@ -504,9 +504,16 @@ intake.</p>
 cats and dogs—Adoption, Transfer, Return, Euthanasia, or Other—from
 information available at intake. This real-world task is relevant to
 shelters managing overcrowding and limited resources.</p>
-<p><strong>Stakeholders:</strong> Shelter staff, animal-care teams,
-adoption and transfer coordinators, and managers allocating shelter
-resources.</p>
+<p><strong>Stakeholders:</strong> 1. <strong>Intake Triage
+Officers</strong>: Require immediate prognostication within the initial
+24-hour admission window to proactively stratify care, flagging incoming
+animals at high risk of prolonged confinement or medical deterioration
+for targeted behavioural rehabilitation and veterinary intervention
+before irreversible outcomes occur. 2. <strong>Transfer &amp; Foster
+Coordinators</strong>: Rely on intake-stage probability trajectories to
+initiate partner rescue placement and foster network scheduling weeks in
+advance, preventing kennel bottlenecks and reducing overall Length of
+Stay (LOS).</p>
 <p><strong>Research question:</strong> To what extent can intake-time
 information of cats and dogs predict these five shelter outcomes for
 each animal’s latest recorded admission?</p>
@@ -1790,8 +1797,9 @@ prepare_features &lt;- function(df) {
       ), levels = c(&quot;No&quot;, &quot;Yes&quot;, &quot;Unknown&quot;)),
 
       # 6. Breed / Colour: fixed text cleaning; frequency grouping is deferred.
-      Primary.Breed = if_else(is_blank(Primary.Breed), &quot;Unknown&quot;,
-                              trimws(as.character(Primary.Breed))),
+      #Primary.Breed = if_else(is_blank(Primary.Breed), &quot;Unknown&quot;,
+      #                        trimws(as.character(Primary.Breed))),
+      Primary.Breed = fct_lump_min(as.factor(Primary.Breed), min = 10, other_level = &quot;Other&quot;),
       Base_Color = factor(case_when(
         is_blank(Primary.Color) ~ &quot;Unknown&quot;,
         str_detect(Primary.Color, regex(&quot;brown|tan|choc|fawn|buff|sable|liver|cinnamon|rust|agouti|bronze|chestnut|sandy|seal&quot;, ignore_case = TRUE)) ~ &quot;Brown/Tan&quot;,
@@ -2017,20 +2025,355 @@ predictor set as the multinomial baseline, one-hot encoded into a
 numeric design matrix for xgboost. Continuous Age_Years_imputed remains
 unstandardised, as tree-based partition algorithms are invariant to
 monotonic scaling (Hastie et al., 2009).</li>
-<li><strong>Class imbalance:</strong> Imbalance will be handled by
-passing per-observation weight values (inverse class frequency) into
-<code>xgb.DMatrix</code>, so that the rare Euthanasia and Other classes
-contribute proportionally more to the training loss than their raw
-counts would suggest.</li>
+<li><strong>Class imbalance:</strong> Each training row receives the
+weight <span class="math inline">\(n / (K \times n_c)\)</span> (training
+rows <span class="math inline">\(n\)</span>, classes <span class="math inline">\(K = 5\)</span>, rows in the row’s class <span class="math inline">\(n_c\)</span>), passed to <code>xgb.DMatrix</code>.
+Every class then carries the same total weight, <span class="math inline">\(n / K\)</span>, in the training loss. Weights are
+computed from the training rows of each fold (and from the full training
+set for the final model) only.</li>
 <li><strong>Evaluation:</strong> Evaluated via shared outcome-stratified
 CV using macro-F1, balanced accuracy, and per-class recall. XGBoost’s
 feature importance will be interpreted alongside correlated predictors
 and validation results; it does not establish an independent or causal
 contribution.</li>
 </ol>
+<pre class="r"><code>library(xgboost)
+library(caret)
+library(dplyr)
+
+outcome_levels &lt;- levels(y_train)
+n_classes      &lt;- length(outcome_levels)
+xgb_seed       &lt;- 5003   # same seed as the shared data split
+xgb_nrounds    &lt;- 150    # fixed number of boosting rounds for every configuration
+
+fmt     &lt;- function(x, digits = 4) sprintf(paste0(&quot;%.&quot;, digits, &quot;f&quot;), x)
+fmt_pct &lt;- function(x, digits = 1) sprintf(paste0(&quot;%.&quot;, digits, &quot;f%%&quot;), 100 * x)
+
+# Overall metrics from actual and predicted labels.
+# Convention: if a class is never predicted, its precision (and therefore F1) is 0.
+evaluate_multiclass_performance &lt;- function(actual, predicted, classes = outcome_levels) {
+  actual    &lt;- factor(actual, levels = classes)
+  predicted &lt;- factor(predicted, levels = classes)
+
+  per_class &lt;- do.call(rbind, lapply(classes, function(cl) {
+    tp &lt;- sum(actual == cl &amp; predicted == cl)
+    fp &lt;- sum(actual != cl &amp; predicted == cl)
+    fn &lt;- sum(actual == cl &amp; predicted != cl)
+    precision &lt;- if (tp + fp == 0) 0 else tp / (tp + fp)
+    recall    &lt;- if (tp + fn == 0) 0 else tp / (tp + fn)
+    f1        &lt;- if (precision + recall == 0) 0 else 2 * precision * recall / (precision + recall)
+    data.frame(Support = tp + fn, Recall = recall, F1 = f1)
+  }))
+
+  c(
+    Accuracy            = mean(actual == predicted),
+    `Weighted-F1`       = weighted.mean(per_class$F1, per_class$Support),
+    `Macro-F1`          = mean(per_class$F1),
+    `Balanced accuracy` = mean(per_class$Recall)   # mean of per-class recall
+  )
+}
+
+class_share    &lt;- prop.table(table(y_train))
+majority_class &lt;- names(which.max(class_share))
+minority_class &lt;- names(which.min(class_share))
+
+# Reference: a predictor that always returns the training majority class (scored on the training labels).
+majority_metric &lt;- evaluate_multiclass_performance(y_train, rep(majority_class, length(y_train)))</code></pre>
+<div id="evaluation-metric" class="section level4">
+<h4>Evaluation metric</h4>
+<p>In the training partition the largest class (Adoption) accounts for
+52.40% of records and the smallest (Other) for 2.84%. A predictor that
+always returns Adoption reaches an accuracy of 0.5240 and a weighted-F1
+of 0.3604, yet its macro-F1 is 0.1375 and its balanced accuracy is
+0.2000. Accuracy and weighted-F1 (which weights classes by their size)
+therefore give a high score to a predictor that ignores four of the five
+outcomes, whereas macro-F1, the unweighted mean of the five per-class F1
+scores, does not. Macro-F1 is used as the primary metric and as the
+tuning criterion for this reason; balanced accuracy (the mean per-class
+recall) and accuracy are reported as supporting values. The multi-class
+log-loss (<code>mlogloss</code>) is only the XGBoost training objective
+and is not used to compare models.</p>
 </div>
-<div id="random-forest" class="section level3">
-<h3>Random Forest</h3>
+<div id="tuning-approach" class="section level4">
+<h4>Tuning approach</h4>
+<p>Balanced weights are used because of the imbalance shown above. Four
+hyperparameters are tuned by grid search: tree depth
+(<code>max_depth</code>: 4, 6), learning rate (<code>eta</code>: 0.05,
+0.10), the fraction of columns sampled per tree
+(<code>colsample_bytree</code>: 0.70, 0.85) and the minimum child weight
+(<code>min_child_weight</code>: 1, 3). These control model complexity
+and the degree of regularisation of the boosted trees (Chen &amp;
+Guestrin, 2016). The row sampling fraction (<code>subsample</code>) is
+fixed at 0.80, the number of boosting rounds at 150, and all other
+parameters are left at the library defaults. Each of the 16
+configurations is evaluated on the five shared folds in
+<code>cv_data</code>, and the one with the highest mean macro-F1 is
+selected. To separate the effect of the weights from the effect of
+tuning, the results below compare three configurations on the same
+folds: (A) library defaults without weights, (B) library defaults with
+balanced weights, and (C) the tuned configuration with balanced
+weights.</p>
+<pre class="r"><code># One-hot design matrices are built once per fold from the fold&#39;s training rows.
+predict_probs &lt;- function(bst, dmat) {
+  p &lt;- predict(bst, dmat, reshape = TRUE)
+  if (is.null(dim(p))) p &lt;- matrix(p, ncol = n_classes, byrow = TRUE)
+  p
+}
+
+cv_matrices &lt;- lapply(1:5, function(k) {
+  d &lt;- cv_data[[k]]
+  dmy     &lt;- dummyVars(~ ., data = d$x_train, fullRank = FALSE)
+  m_train &lt;- predict(dmy, newdata = d$x_train)
+  m_valid &lt;- predict(dmy, newdata = d$x_valid)
+
+  lbl_train &lt;- as.integer(d$y_train) - 1   # XGBoost expects 0-indexed labels
+  lbl_valid &lt;- as.integer(d$y_valid) - 1
+
+  counts  &lt;- table(d$y_train)
+  w_class &lt;- nrow(d$x_train) / (n_classes * counts)
+  w_train &lt;- as.numeric(w_class[as.character(d$y_train)])
+
+  list(
+    dtrain_unweighted = xgb.DMatrix(data = m_train, label = lbl_train),
+    dtrain_weighted   = xgb.DMatrix(data = m_train, label = lbl_train, weight = w_train),
+    dvalid            = xgb.DMatrix(data = m_valid, label = lbl_valid),
+    y_valid           = d$y_valid
+  )
+})
+
+base_params &lt;- list(
+  booster = &quot;gbtree&quot;, objective = &quot;multi:softprob&quot;, num_class = n_classes,
+  eval_metric = &quot;mlogloss&quot;, seed = xgb_seed
+)
+
+# Mean 5-fold CV metrics of one configuration (also returns the fold macro-F1 for the SD).
+run_xgb_cv &lt;- function(params, weighted) {
+  scores &lt;- t(sapply(1:5, function(k) {
+    m      &lt;- cv_matrices[[k]]
+    dtrain &lt;- if (weighted) m$dtrain_weighted else m$dtrain_unweighted
+    bst    &lt;- xgb.train(params = c(base_params, params), data = dtrain,
+                        nrounds = xgb_nrounds, verbose = 0)
+    probs  &lt;- predict_probs(bst, m$dvalid)
+    pred   &lt;- factor(outcome_levels[max.col(probs, ties.method = &quot;first&quot;)], levels = outcome_levels)
+    evaluate_multiclass_performance(m$y_valid, pred)
+  }))
+  c(Macro_F1 = mean(scores[, &quot;Macro-F1&quot;]), SD_Macro_F1 = sd(scores[, &quot;Macro-F1&quot;]),
+    Balanced_Accuracy = mean(scores[, &quot;Balanced accuracy&quot;]), Accuracy = mean(scores[, &quot;Accuracy&quot;]))
+}
+
+# A and B: library defaults for the tuned parameters.
+default_params &lt;- list(max_depth = 6, eta = 0.3)
+cv_A &lt;- run_xgb_cv(default_params, weighted = FALSE)
+cv_B &lt;- run_xgb_cv(default_params, weighted = TRUE)
+
+# C: grid search with balanced weights, selected by mean CV macro-F1.
+tuning_grid &lt;- expand.grid(
+  max_depth = c(4, 6), eta = c(0.05, 0.10), subsample = 0.80,
+  colsample_bytree = c(0.70, 0.85), min_child_weight = c(1, 3)
+)
+grid_cv     &lt;- t(sapply(seq_len(nrow(tuning_grid)),
+                        function(i) run_xgb_cv(as.list(tuning_grid[i, ]), weighted = TRUE)))
+best_index  &lt;- which.max(grid_cv[, &quot;Macro_F1&quot;])   # first one if tied
+best_config &lt;- tuning_grid[best_index, ]
+cv_C        &lt;- grid_cv[best_index, ]
+
+cv_comparison &lt;- data.frame(
+  Configuration = c(&quot;A. Defaults, unweighted&quot;, &quot;B. Defaults, balanced weights&quot;, &quot;C. Tuned, balanced weights&quot;),
+  rbind(cv_A, cv_B, cv_C), row.names = NULL
+)
+colnames(cv_comparison)[-1] &lt;- c(&quot;Mean macro-F1&quot;, &quot;SD macro-F1&quot;, &quot;Mean balanced accuracy&quot;, &quot;Mean accuracy&quot;)
+knitr::kable(cv_comparison, digits = 4,
+             caption = &quot;5-fold CV performance (same folds, same number of boosting rounds)&quot;)</code></pre>
+<table>
+<caption>5-fold CV performance (same folds, same number of boosting
+rounds)</caption>
+<colgroup>
+<col width="32%" />
+<col width="15%" />
+<col width="12%" />
+<col width="24%" />
+<col width="15%" />
+</colgroup>
+<thead>
+<tr class="header">
+<th align="left">Configuration</th>
+<th align="right">Mean macro-F1</th>
+<th align="right">SD macro-F1</th>
+<th align="right">Mean balanced accuracy</th>
+<th align="right">Mean accuracy</th>
+</tr>
+</thead>
+<tbody>
+<tr class="odd">
+<td align="left">A. Defaults, unweighted</td>
+<td align="right">0.4937</td>
+<td align="right">0.0205</td>
+<td align="right">0.4711</td>
+<td align="right">0.7962</td>
+</tr>
+<tr class="even">
+<td align="left">B. Defaults, balanced weights</td>
+<td align="right">0.4745</td>
+<td align="right">0.0150</td>
+<td align="right">0.5133</td>
+<td align="right">0.6942</td>
+</tr>
+<tr class="odd">
+<td align="left">C. Tuned, balanced weights</td>
+<td align="right">0.4939</td>
+<td align="right">0.0107</td>
+<td align="right">0.5558</td>
+<td align="right">0.6868</td>
+</tr>
+</tbody>
+</table>
+</div>
+<div id="results" class="section level4">
+<h4>Results</h4>
+<p><strong>Cross-validation.</strong> Across the 16 grid configurations,
+mean CV macro-F1 ranged from 0.4774 to 0.4939. The selected
+configuration (<code>max_depth</code> = 6, <code>eta</code> = 0.05,
+<code>colsample_bytree</code> = 0.85, <code>min_child_weight</code> = 3)
+reached a mean macro-F1 of 0.4939 (SD 0.0107). Adding balanced weights
+changed mean macro-F1 from 0.4937 (A) to 0.4745 (B), and mean accuracy
+from 0.7962 to 0.6942. Tuning changed mean macro-F1 from 0.4745 (B) to
+0.4939 (C). Because the selected value is the maximum over 16
+candidates, it is the selection criterion and not an independent
+performance estimate; the held-out result below is reported
+separately.</p>
+<pre class="r"><code># Refit the selected configuration on the full training partition and score the held-out partition.
+dmy_full    &lt;- dummyVars(~ ., data = x_train, fullRank = FALSE)
+X_train_mat &lt;- predict(dmy_full, newdata = x_train)
+X_test_mat  &lt;- predict(dmy_full, newdata = x_test)
+
+lbl_train &lt;- as.integer(y_train) - 1
+lbl_test  &lt;- as.integer(y_test) - 1
+
+train_counts         &lt;- table(y_train)
+class_weights        &lt;- nrow(x_train) / (n_classes * train_counts)
+train_sample_weights &lt;- as.numeric(class_weights[as.character(y_train)])
+
+dtrain_final &lt;- xgb.DMatrix(data = X_train_mat, label = lbl_train, weight = train_sample_weights)
+dtest_final  &lt;- xgb.DMatrix(data = X_test_mat,  label = lbl_test)
+
+final_bst &lt;- xgb.train(params = c(base_params, as.list(best_config)), data = dtrain_final,
+                       nrounds = xgb_nrounds, verbose = 0)
+
+probs_test &lt;- predict_probs(final_bst, dtest_final)
+pred_test  &lt;- factor(outcome_levels[max.col(probs_test, ties.method = &quot;first&quot;)], levels = outcome_levels)
+
+test_value &lt;- evaluate_multiclass_performance(y_test, pred_test)
+test_major &lt;- evaluate_multiclass_performance(y_test, rep(majority_class, length(y_test)))
+
+knitr::kable(
+  data.frame(Metric = names(test_value), XGBoost = as.numeric(test_value),
+             Majority_class_predictor = as.numeric(test_major)),
+  digits = 4, caption = &quot;Held-out test performance&quot;
+)</code></pre>
+<table>
+<caption>Held-out test performance</caption>
+<thead>
+<tr class="header">
+<th align="left">Metric</th>
+<th align="right">XGBoost</th>
+<th align="right">Majority_class_predictor</th>
+</tr>
+</thead>
+<tbody>
+<tr class="odd">
+<td align="left">Accuracy</td>
+<td align="right">0.6831</td>
+<td align="right">0.5244</td>
+</tr>
+<tr class="even">
+<td align="left">Weighted-F1</td>
+<td align="right">0.7155</td>
+<td align="right">0.3608</td>
+</tr>
+<tr class="odd">
+<td align="left">Macro-F1</td>
+<td align="right">0.4815</td>
+<td align="right">0.1376</td>
+</tr>
+<tr class="even">
+<td align="left">Balanced accuracy</td>
+<td align="right">0.5381</td>
+<td align="right">0.2000</td>
+</tr>
+</tbody>
+</table>
+<pre class="r"><code># Gain-based importance, summed over the one-hot columns of each original predictor.
+imp &lt;- xgb.importance(feature_names = colnames(X_train_mat), model = final_bst)
+importance_by_predictor &lt;- data.frame(
+  Predictor = model_predictors,
+  Gain = sapply(model_predictors, function(p)
+    sum(imp$Gain[imp$Feature == p | startsWith(imp$Feature, paste0(p, &quot;.&quot;))])),
+  row.names = NULL
+)
+importance_by_predictor &lt;- importance_by_predictor[order(-importance_by_predictor$Gain), ]
+knitr::kable(importance_by_predictor, digits = 4,
+             caption = &quot;Share of total split gain per predictor&quot;)</code></pre>
+<table>
+<caption>Share of total split gain per predictor</caption>
+<thead>
+<tr class="header">
+<th align="left"></th>
+<th align="left">Predictor</th>
+<th align="right">Gain</th>
+</tr>
+</thead>
+<tbody>
+<tr class="odd">
+<td align="left">3</td>
+<td align="left">Spayed.Neutered</td>
+<td align="right">0.3727</td>
+</tr>
+<tr class="even">
+<td align="left">8</td>
+<td align="left">Age_Years_imputed</td>
+<td align="right">0.3161</td>
+</tr>
+<tr class="odd">
+<td align="left">5</td>
+<td align="left">Base_Color</td>
+<td align="right">0.0775</td>
+</tr>
+<tr class="even">
+<td align="left">4</td>
+<td align="left">primary.breed.group</td>
+<td align="right">0.0683</td>
+</tr>
+<tr class="odd">
+<td align="left">7</td>
+<td align="left">has_Name</td>
+<td align="right">0.0569</td>
+</tr>
+<tr class="even">
+<td align="left">2</td>
+<td align="left">Sex</td>
+<td align="right">0.0471</td>
+</tr>
+<tr class="odd">
+<td align="left">1</td>
+<td align="left">Type</td>
+<td align="right">0.0404</td>
+</tr>
+<tr class="even">
+<td align="left">6</td>
+<td align="left">has_pattern</td>
+<td align="right">0.0211</td>
+</tr>
+</tbody>
+</table>
+<p><strong>Held-out test set.</strong> The tuned model obtained a
+macro-F1 of 0.4815, a balanced accuracy of 0.5381 and an accuracy of
+0.6831, compared with 0.1376, 0.2000 and 0.5244 for the majority-class
+predictor. The test macro-F1 differs from the mean CV macro-F1 of the
+selected configuration by -0.0123.</p>
+<p><strong>Feature importance.</strong> By split gain, Spayed.Neutered
+has the largest share (37.3%), followed by Age_Years_imputed (31.6%).
+These shares describe the splits of the fitted trees only and are not a
+causal effect. ### Random Forest</p>
 <ol style="list-style-type: decimal">
 <li><strong>Purpose and justification:</strong> Random Forest is a
 non-linear ensemble model and it is suitable for classification. By
@@ -2063,6 +2406,7 @@ XGBoost importance ranking.</li>
 # from this training part&#39;s outcome frequencies only.
 # Use y_train/y_test as the response; x_train/x_test contain predictors only.
 # TODO: fit Random Forest and retain out-of-fold predictions.</code></pre>
+</div>
 </div>
 <div id="support-vector-machine-svm" class="section level3">
 <h3>Support Vector Machine (SVM)</h3>

@@ -921,8 +921,9 @@ prepare_features <- function(df) {
       ), levels = c("No", "Yes", "Unknown")),
 
       # 6. Breed / Colour: fixed text cleaning; frequency grouping is deferred.
-      Primary.Breed = if_else(is_blank(Primary.Breed), "Unknown",
-                              trimws(as.character(Primary.Breed))),
+      #Primary.Breed = if_else(is_blank(Primary.Breed), "Unknown",
+      #                        trimws(as.character(Primary.Breed))),
+      Primary.Breed = fct_lump_min(as.factor(Primary.Breed), min = 10, other_level = "Other"),
       Base_Color = factor(case_when(
         is_blank(Primary.Color) ~ "Unknown",
         str_detect(Primary.Color, regex("brown|tan|choc|fawn|buff|sable|liver|cinnamon|rust|agouti|bronze|chestnut|sandy|seal", ignore_case = TRUE)) ~ "Brown/Tan",
@@ -1136,172 +1137,188 @@ for (k in 1:5) {
 
 1.  **Purpose and justification:** Use XGBoost as the primary non-linear model for the classification. By sequentially fitting trees to residual errors with regularised loss (Chen & Guestrin, 2016), it excels on heterogeneous tabular data over deep learning alternatives (Grinsztajn et al., 2022). It benchmarks the non-linear predictive signal extractable beyond the linear baseline.
 2.  **Predictors and preprocessing:** We use the same predictor set as the multinomial baseline, one-hot encoded into a numeric design matrix for xgboost. Continuous Age_Years_imputed remains unstandardised, as tree-based partition algorithms are invariant to monotonic scaling (Hastie et al., 2009).
-3.  **Class imbalance:** Imbalance will be handled by passing per-observation weight values (inverse class frequency) into `xgb.DMatrix`, so that the rare Euthanasia and Other classes contribute proportionally more to the training loss than their raw counts would suggest.
+3.  **Class imbalance:** Each training row receives the weight $n / (K \times n_c)$ (training rows $n$, classes $K = 5$, rows in the row's class $n_c$), passed to `xgb.DMatrix`. Every class then carries the same total weight, $n / K$, in the training loss. Weights are computed from the training rows of each fold (and from the full training set for the final model) only.
 4.  **Evaluation:** Evaluated via shared outcome-stratified CV using macro-F1, balanced accuracy, and per-class recall. XGBoost's feature importance will be interpreted alongside correlated predictors and validation results; it does not establish an independent or causal contribution.
 
-```{r fit-xgboost, eval=FALSE, warning=FALSE, message=FALSE}
+
+```{r xgb-setup, warning=FALSE, message=FALSE}
 library(xgboost)
 library(caret)
 library(dplyr)
 
-# 2. define Macro-F1 function
-calc_macro_f1 <- function(actual, predicted, classes) {
-  f1s <- sapply(classes, function(cl) {
+outcome_levels <- levels(y_train)
+n_classes      <- length(outcome_levels)
+xgb_seed       <- 5003   # same seed as the shared data split
+xgb_nrounds    <- 150    # fixed number of boosting rounds for every configuration
+
+fmt     <- function(x, digits = 4) sprintf(paste0("%.", digits, "f"), x)
+fmt_pct <- function(x, digits = 1) sprintf(paste0("%.", digits, "f%%"), 100 * x)
+
+# Overall metrics from actual and predicted labels.
+# Convention: if a class is never predicted, its precision (and therefore F1) is 0.
+evaluate_multiclass_performance <- function(actual, predicted, classes = outcome_levels) {
+  actual    <- factor(actual, levels = classes)
+  predicted <- factor(predicted, levels = classes)
+
+  per_class <- do.call(rbind, lapply(classes, function(cl) {
     tp <- sum(actual == cl & predicted == cl)
     fp <- sum(actual != cl & predicted == cl)
     fn <- sum(actual == cl & predicted != cl)
-    prec <- ifelse(tp + fp == 0, 0, tp / (tp + fp))
-    rec  <- ifelse(tp + fn == 0, 0, tp / (tp + fn))
-    ifelse(prec + rec == 0, 0, 2 * prec * rec / (prec + rec))
-  })
-  mean(f1s, na.rm = TRUE)
+    precision <- if (tp + fp == 0) 0 else tp / (tp + fp)
+    recall    <- if (tp + fn == 0) 0 else tp / (tp + fn)
+    f1        <- if (precision + recall == 0) 0 else 2 * precision * recall / (precision + recall)
+    data.frame(Support = tp + fn, Recall = recall, F1 = f1)
+  }))
+
+  c(
+    Accuracy            = mean(actual == predicted),
+    `Weighted-F1`       = weighted.mean(per_class$F1, per_class$Support),
+    `Macro-F1`          = mean(per_class$F1),
+    `Balanced accuracy` = mean(per_class$Recall)   # mean of per-class recall
+  )
 }
 
-# 3. baseline model for 5-Fold CV
-baseline_cv_f1 <- numeric(5)
+class_share    <- prop.table(table(y_train))
+majority_class <- names(which.max(class_share))
+minority_class <- names(which.min(class_share))
 
-for (k in 1:5) {
-  # kth fold
-  fold_xtrain <- cv_data[[k]]$x_train
-  fold_ytrain <- cv_data[[k]]$y_train
-  fold_xvalid <- cv_data[[k]]$x_valid
-  fold_yvalid <- cv_data[[k]]$y_valid
-  
-  # train kth data
-  dmy <- dummyVars(~ ., data = fold_xtrain, fullRank = FALSE)
-  m_train <- predict(dmy, newdata = fold_xtrain)
-  m_valid <- predict(dmy, newdata = fold_xvalid)
-  
-  # convert to 0-indexed labels (XGBoost)
-  lbl_train <- as.integer(fold_ytrain) - 1
-  lbl_valid <- as.integer(fold_yvalid) - 1
-  
-  dtrain <- xgb.DMatrix(data = m_train, label = lbl_train)
-  dvalid <- xgb.DMatrix(data = m_valid, label = lbl_valid)
-  
-  # Baseline 
-  base_params <- list(
-    booster     = "gbtree",
-    objective   = "multi:softprob",
-    num_class   = n_classes,
-    eval_metric = "mlogloss",
-    max_depth   = 6,
-    eta         = 0.3
-  )
-  
-  bst_base <- xgb.train(
-    params  = base_params,
-    data    = dtrain,
-    nrounds = 100,
-    verbose = 0
-  )
-  
-  # predict and calculate the fold's Macro-F1
-  probs <- predict(bst_base, dvalid, reshape = TRUE)
-  preds <- max.col(probs) - 1
-  pred_factor <- factor(outcome_levels[preds + 1], levels = outcome_levels)
-  
-  baseline_cv_f1[k] <- calc_macro_f1(fold_yvalid, pred_factor, outcome_levels)
-}
-
-cat(sprintf("Baseline XGBoost 5-Fold CV Macro-F1: %.4f (± %.4f)\n", 
-            mean(baseline_cv_f1), sd(baseline_cv_f1)))
+# Reference: a predictor that always returns the training majority class (scored on the training labels).
+majority_metric <- evaluate_multiclass_performance(y_train, rep(majority_class, length(y_train)))
 ```
 
-```{r fit-xgboost, eval=FALSE, warning=FALSE, message=FALSE}
+#### Evaluation metric
 
-# ==============================================================================
-# Model Improvement: Cost-Sensitive + Grid Search
-# ==============================================================================
+In the training partition the largest class (`r majority_class`) accounts for `r fmt_pct(max(class_share), 2)` of records and the smallest (`r minority_class`) for `r fmt_pct(min(class_share), 2)`. A predictor that always returns `r majority_class` reaches an accuracy of `r fmt(majority_metric["Accuracy"])` and a weighted-F1 of `r fmt(majority_metric["Weighted-F1"])`, yet its macro-F1 is `r fmt(majority_metric["Macro-F1"])` and its balanced accuracy is `r fmt(majority_metric["Balanced accuracy"])`. Accuracy and weighted-F1 (which weights classes by their size) therefore give a high score to a predictor that ignores four of the five outcomes, whereas macro-F1, the unweighted mean of the five per-class F1 scores, does not. Macro-F1 is used as the primary metric and as the tuning criterion for this reason; balanced accuracy (the mean per-class recall) and accuracy are reported as supporting values. The multi-class log-loss (`mlogloss`) is only the XGBoost training objective and is not used to compare models.
 
-# hyperparameters
-tuning_grid <- expand.grid(
-  max_depth        = c(4, 6),
-  eta              = c(0.05, 0.10),
-  subsample        = c(0.80),
-  colsample_bytree = c(0.70, 0.85),
-  min_child_weight = c(1, 3)
+#### Tuning approach
+
+Balanced weights are used because of the imbalance shown above. Four hyperparameters are tuned by grid search: tree depth (`max_depth`: 4, 6), learning rate (`eta`: 0.05, 0.10), the fraction of columns sampled per tree (`colsample_bytree`: 0.70, 0.85) and the minimum child weight (`min_child_weight`: 1, 3). These control model complexity and the degree of regularisation of the boosted trees (Chen & Guestrin, 2016). The row sampling fraction (`subsample`) is fixed at 0.80, the number of boosting rounds at `r xgb_nrounds`, and all other parameters are left at the library defaults. Each of the 16 configurations is evaluated on the five shared folds in `cv_data`, and the one with the highest mean macro-F1 is selected. To separate the effect of the weights from the effect of tuning, the results below compare three configurations on the same folds: (A) library defaults without weights, (B) library defaults with balanced weights, and (C) the tuned configuration with balanced weights.
+
+```{r xgb-cv}
+# One-hot design matrices are built once per fold from the fold's training rows.
+predict_probs <- function(bst, dmat) {
+  p <- predict(bst, dmat, reshape = TRUE)
+  if (is.null(dim(p))) p <- matrix(p, ncol = n_classes, byrow = TRUE)
+  p
+}
+
+cv_matrices <- lapply(1:5, function(k) {
+  d <- cv_data[[k]]
+  dmy     <- dummyVars(~ ., data = d$x_train, fullRank = FALSE)
+  m_train <- predict(dmy, newdata = d$x_train)
+  m_valid <- predict(dmy, newdata = d$x_valid)
+
+  lbl_train <- as.integer(d$y_train) - 1   # XGBoost expects 0-indexed labels
+  lbl_valid <- as.integer(d$y_valid) - 1
+
+  counts  <- table(d$y_train)
+  w_class <- nrow(d$x_train) / (n_classes * counts)
+  w_train <- as.numeric(w_class[as.character(d$y_train)])
+
+  list(
+    dtrain_unweighted = xgb.DMatrix(data = m_train, label = lbl_train),
+    dtrain_weighted   = xgb.DMatrix(data = m_train, label = lbl_train, weight = w_train),
+    dvalid            = xgb.DMatrix(data = m_valid, label = lbl_valid),
+    y_valid           = d$y_valid
+  )
+})
+
+base_params <- list(
+  booster = "gbtree", objective = "multi:softprob", num_class = n_classes,
+  eval_metric = "mlogloss", seed = xgb_seed
 )
 
-best_macro_f1 <- -Inf
-best_config   <- NULL
-config_results <- numeric(nrow(tuning_grid))
-
-cat(sprintf("Evaluating %d th hyperparameter (5-Fold CV)...\n", nrow(tuning_grid)))
-
-for (cfg in 1:nrow(tuning_grid)) {
-  current_params <- tuning_grid[cfg, ]
-  fold_f1s <- numeric(5)
-  
-  for (k in 1:5) {
-    fold_xtrain <- cv_data[[k]]$x_train
-    fold_ytrain <- cv_data[[k]]$y_train
-    fold_xvalid <- cv_data[[k]]$x_valid
-    fold_yvalid <- cv_data[[k]]$y_valid
-    
-    dmy <- dummyVars(~ ., data = fold_xtrain, fullRank = FALSE)
-    m_train <- predict(dmy, newdata = fold_xtrain)
-    m_valid <- predict(dmy, newdata = fold_xvalid)
-    
-    lbl_train <- as.integer(fold_ytrain) - 1
-    lbl_valid <- as.integer(fold_yvalid) - 1
-    
-    # calculate the weight of each category in each Fold
-    class_counts <- table(fold_ytrain)
-    weights_per_class <- nrow(fold_xtrain) / (length(class_counts) * class_counts)
-    sample_weights <- as.numeric(weights_per_class[as.character(fold_ytrain)])
-    
-    dtrain <- xgb.DMatrix(data = m_train, label = lbl_train, weight = sample_weights)
-    dvalid <- xgb.DMatrix(data = m_valid, label = lbl_valid)
-    
-    model_params <- list(
-      booster          = "gbtree",
-      objective        = "multi:softprob",
-      num_class        = n_classes,
-      eval_metric      = "mlogloss",
-      max_depth        = current_params$max_depth,
-      eta              = current_params$eta,
-      subsample        = current_params$subsample,
-      colsample_bytree = current_params$colsample_bytree,
-      min_child_weight = current_params$min_child_weight
-    )
-    
-    bst_tuned <- xgb.train(
-      params                = model_params,
-      data                  = dtrain,
-      nrounds               = 250,
-      watchlist             = list(eval = dvalid),
-      early_stopping_rounds = 20,
-      verbose               = 0
-    )
-    
-    probs <- predict(bst_tuned, dvalid, reshape = TRUE)
-    preds <- max.col(probs) - 1
-    pred_factor <- factor(outcome_levels[preds + 1], levels = outcome_levels)
-    
-    fold_f1s[k] <- calc_macro_f1(fold_yvalid, pred_factor, outcome_levels)
-  }
-  
-  mean_f1 <- mean(fold_f1s)
-  config_results[cfg] <- mean_f1
-  
-  if (mean_f1 > best_macro_f1) {
-    best_macro_f1 <- mean_f1
-    best_config   <- current_params
-  }
+# Mean 5-fold CV metrics of one configuration (also returns the fold macro-F1 for the SD).
+run_xgb_cv <- function(params, weighted) {
+  scores <- t(sapply(1:5, function(k) {
+    m      <- cv_matrices[[k]]
+    dtrain <- if (weighted) m$dtrain_weighted else m$dtrain_unweighted
+    bst    <- xgb.train(params = c(base_params, params), data = dtrain,
+                        nrounds = xgb_nrounds, verbose = 0)
+    probs  <- predict_probs(bst, m$dvalid)
+    pred   <- factor(outcome_levels[max.col(probs, ties.method = "first")], levels = outcome_levels)
+    evaluate_multiclass_performance(m$y_valid, pred)
+  }))
+  c(Macro_F1 = mean(scores[, "Macro-F1"]), SD_Macro_F1 = sd(scores[, "Macro-F1"]),
+    Balanced_Accuracy = mean(scores[, "Balanced accuracy"]), Accuracy = mean(scores[, "Accuracy"]))
 }
 
-# 2. result
-cat("\n=======================================================\n")
-cat("                 CV For Tuning (XGBoost)               \n")
-cat("=======================================================\n")
-cat(sprintf("Baseline CV Macro-F1  : %.4f\n", mean(baseline_cv_f1)))
-cat(sprintf("Weighted CV Macro-F1  : %.4f\n", best_macro_f1))
-cat(sprintf("Macro-F1 Difference            : +%.4f\n", best_macro_f1 - mean(baseline_cv_f1)))
-cat("\nBest Parameter:\n")
-print(best_config)
+# A and B: library defaults for the tuned parameters.
+default_params <- list(max_depth = 6, eta = 0.3)
+cv_A <- run_xgb_cv(default_params, weighted = FALSE)
+cv_B <- run_xgb_cv(default_params, weighted = TRUE)
 
+# C: grid search with balanced weights, selected by mean CV macro-F1.
+tuning_grid <- expand.grid(
+  max_depth = c(4, 6), eta = c(0.05, 0.10), subsample = 0.80,
+  colsample_bytree = c(0.70, 0.85), min_child_weight = c(1, 3)
+)
+grid_cv     <- t(sapply(seq_len(nrow(tuning_grid)),
+                        function(i) run_xgb_cv(as.list(tuning_grid[i, ]), weighted = TRUE)))
+best_index  <- which.max(grid_cv[, "Macro_F1"])   # first one if tied
+best_config <- tuning_grid[best_index, ]
+cv_C        <- grid_cv[best_index, ]
+
+cv_comparison <- data.frame(
+  Configuration = c("A. Defaults, unweighted", "B. Defaults, balanced weights", "C. Tuned, balanced weights"),
+  rbind(cv_A, cv_B, cv_C), row.names = NULL
+)
+colnames(cv_comparison)[-1] <- c("Mean macro-F1", "SD macro-F1", "Mean balanced accuracy", "Mean accuracy")
+knitr::kable(cv_comparison, digits = 4,
+             caption = "5-fold CV performance (same folds, same number of boosting rounds)")
 ```
+
+#### Results
+
+**Cross-validation.** Across the 16 grid configurations, mean CV macro-F1 ranged from `r fmt(min(grid_cv[, "Macro_F1"]))` to `r fmt(max(grid_cv[, "Macro_F1"]))`. The selected configuration (`max_depth` = `r best_config$max_depth`, `eta` = `r best_config$eta`, `colsample_bytree` = `r best_config$colsample_bytree`, `min_child_weight` = `r best_config$min_child_weight`) reached a mean macro-F1 of `r fmt(cv_C["Macro_F1"])` (SD `r fmt(cv_C["SD_Macro_F1"])`). Adding balanced weights changed mean macro-F1 from `r fmt(cv_A["Macro_F1"])` (A) to `r fmt(cv_B["Macro_F1"])` (B), and mean accuracy from `r fmt(cv_A["Accuracy"])` to `r fmt(cv_B["Accuracy"])`. Tuning changed mean macro-F1 from `r fmt(cv_B["Macro_F1"])` (B) to `r fmt(cv_C["Macro_F1"])` (C). Because the selected value is the maximum over 16 candidates, it is the selection criterion and not an independent performance estimate; the held-out result below is reported separately.
+
+```{r xgb-final-model}
+# Refit the selected configuration on the full training partition and score the held-out partition.
+dmy_full    <- dummyVars(~ ., data = x_train, fullRank = FALSE)
+X_train_mat <- predict(dmy_full, newdata = x_train)
+X_test_mat  <- predict(dmy_full, newdata = x_test)
+
+lbl_train <- as.integer(y_train) - 1
+lbl_test  <- as.integer(y_test) - 1
+
+train_counts         <- table(y_train)
+class_weights        <- nrow(x_train) / (n_classes * train_counts)
+train_sample_weights <- as.numeric(class_weights[as.character(y_train)])
+
+dtrain_final <- xgb.DMatrix(data = X_train_mat, label = lbl_train, weight = train_sample_weights)
+dtest_final  <- xgb.DMatrix(data = X_test_mat,  label = lbl_test)
+
+final_bst <- xgb.train(params = c(base_params, as.list(best_config)), data = dtrain_final,
+                       nrounds = xgb_nrounds, verbose = 0)
+
+probs_test <- predict_probs(final_bst, dtest_final)
+pred_test  <- factor(outcome_levels[max.col(probs_test, ties.method = "first")], levels = outcome_levels)
+
+test_value <- evaluate_multiclass_performance(y_test, pred_test)
+test_major <- evaluate_multiclass_performance(y_test, rep(majority_class, length(y_test)))
+
+knitr::kable(
+  data.frame(Metric = names(test_value), XGBoost = as.numeric(test_value),
+             Majority_class_predictor = as.numeric(test_major)),
+  digits = 4, caption = "Held-out test performance"
+)
+
+# Gain-based importance, summed over the one-hot columns of each original predictor.
+imp <- xgb.importance(feature_names = colnames(X_train_mat), model = final_bst)
+importance_by_predictor <- data.frame(
+  Predictor = model_predictors,
+  Gain = sapply(model_predictors, function(p)
+    sum(imp$Gain[imp$Feature == p | startsWith(imp$Feature, paste0(p, "."))])),
+  row.names = NULL
+)
+importance_by_predictor <- importance_by_predictor[order(-importance_by_predictor$Gain), ]
+knitr::kable(importance_by_predictor, digits = 4,
+             caption = "Share of total split gain per predictor")
+```
+
+**Held-out test set.** The tuned model obtained a macro-F1 of `r fmt(test_value["Macro-F1"])`, a balanced accuracy of `r fmt(test_value["Balanced accuracy"])` and an accuracy of `r fmt(test_value["Accuracy"])`, compared with `r fmt(test_major["Macro-F1"])`, `r fmt(test_major["Balanced accuracy"])` and `r fmt(test_major["Accuracy"])` for the majority-class predictor. The test macro-F1 differs from the mean CV macro-F1 of the selected configuration by `r sprintf("%+.4f", test_value["Macro-F1"] - cv_C["Macro_F1"])`.
+
+**Feature importance.** By split gain, `r importance_by_predictor$Predictor[1]` has the largest share (`r fmt_pct(importance_by_predictor$Gain[1])`), followed by `r importance_by_predictor$Predictor[2]` (`r fmt_pct(importance_by_predictor$Gain[2])`). These shares describe the splits of the fitted trees only and are not a causal effect.
 ### Random Forest
 
 1.  **Purpose and justification:** Random Forest is a non-linear ensemble model and it is suitable for classification. By averaging many decision trees built from bootstrap samples and random subsets of predictors, Random Forest can reduce the variance and overfitting of a single decision tree.
