@@ -1797,9 +1797,9 @@ prepare_features &lt;- function(df) {
       ), levels = c(&quot;No&quot;, &quot;Yes&quot;, &quot;Unknown&quot;)),
 
       # 6. Breed / Colour: fixed text cleaning; frequency grouping is deferred.
-      #Primary.Breed = if_else(is_blank(Primary.Breed), &quot;Unknown&quot;,
-      #                        trimws(as.character(Primary.Breed))),
-      Primary.Breed = fct_lump_min(as.factor(Primary.Breed), min = 10, other_level = &quot;Other&quot;),
+      Primary.Breed = if_else(is_blank(Primary.Breed), &quot;Unknown&quot;,
+                              trimws(as.character(Primary.Breed))),
+      # Primary.Breed = fct_lump_min(as.factor(Primary.Breed), min = 10, other_level = &quot;Other&quot;),
       Base_Color = factor(case_when(
         is_blank(Primary.Color) ~ &quot;Unknown&quot;,
         str_detect(Primary.Color, regex(&quot;brown|tan|choc|fawn|buff|sable|liver|cinnamon|rust|agouti|bronze|chestnut|sandy|seal&quot;, ignore_case = TRUE)) ~ &quot;Brown/Tan&quot;,
@@ -2206,24 +2206,24 @@ rounds)</caption>
 <tbody>
 <tr class="odd">
 <td align="left">A. Defaults, unweighted</td>
-<td align="right">0.4937</td>
-<td align="right">0.0205</td>
-<td align="right">0.4711</td>
-<td align="right">0.7962</td>
+<td align="right">0.4858</td>
+<td align="right">0.0186</td>
+<td align="right">0.4650</td>
+<td align="right">0.7935</td>
 </tr>
 <tr class="even">
 <td align="left">B. Defaults, balanced weights</td>
-<td align="right">0.4745</td>
-<td align="right">0.0150</td>
-<td align="right">0.5133</td>
-<td align="right">0.6942</td>
+<td align="right">0.4758</td>
+<td align="right">0.0120</td>
+<td align="right">0.5146</td>
+<td align="right">0.6929</td>
 </tr>
 <tr class="odd">
 <td align="left">C. Tuned, balanced weights</td>
-<td align="right">0.4939</td>
-<td align="right">0.0107</td>
-<td align="right">0.5558</td>
-<td align="right">0.6868</td>
+<td align="right">0.4912</td>
+<td align="right">0.0124</td>
+<td align="right">0.5521</td>
+<td align="right">0.6858</td>
 </tr>
 </tbody>
 </table>
@@ -2231,13 +2231,13 @@ rounds)</caption>
 <div id="results" class="section level4">
 <h4>Results</h4>
 <p><strong>Cross-validation.</strong> Across the 16 grid configurations,
-mean CV macro-F1 ranged from 0.4774 to 0.4939. The selected
+mean CV macro-F1 ranged from 0.4768 to 0.4912. The selected
 configuration (<code>max_depth</code> = 6, <code>eta</code> = 0.05,
 <code>colsample_bytree</code> = 0.85, <code>min_child_weight</code> = 3)
-reached a mean macro-F1 of 0.4939 (SD 0.0107). Adding balanced weights
-changed mean macro-F1 from 0.4937 (A) to 0.4745 (B), and mean accuracy
-from 0.7962 to 0.6942. Tuning changed mean macro-F1 from 0.4745 (B) to
-0.4939 (C). Because the selected value is the maximum over 16
+reached a mean macro-F1 of 0.4912 (SD 0.0124). Adding balanced weights
+changed mean macro-F1 from 0.4858 (A) to 0.4758 (B), and mean accuracy
+from 0.7935 to 0.6929. Tuning changed mean macro-F1 from 0.4758 (B) to
+0.4912 (C). Because the selected value is the maximum over 16
 candidates, it is the selection criterion and not an independent
 performance estimate; the held-out result below is reported
 separately.</p>
@@ -2282,22 +2282,22 @@ knitr::kable(
 <tbody>
 <tr class="odd">
 <td align="left">Accuracy</td>
-<td align="right">0.6831</td>
+<td align="right">0.6712</td>
 <td align="right">0.5244</td>
 </tr>
 <tr class="even">
 <td align="left">Weighted-F1</td>
-<td align="right">0.7155</td>
+<td align="right">0.7066</td>
 <td align="right">0.3608</td>
 </tr>
 <tr class="odd">
 <td align="left">Macro-F1</td>
-<td align="right">0.4815</td>
+<td align="right">0.4738</td>
 <td align="right">0.1376</td>
 </tr>
 <tr class="even">
 <td align="left">Balanced accuracy</td>
-<td align="right">0.5381</td>
+<td align="right">0.5342</td>
 <td align="right">0.2000</td>
 </tr>
 </tbody>
@@ -2326,52 +2326,52 @@ knitr::kable(importance_by_predictor, digits = 4,
 <tr class="odd">
 <td align="left">3</td>
 <td align="left">Spayed.Neutered</td>
-<td align="right">0.3727</td>
+<td align="right">0.3752</td>
 </tr>
 <tr class="even">
 <td align="left">8</td>
 <td align="left">Age_Years_imputed</td>
-<td align="right">0.3161</td>
+<td align="right">0.3175</td>
 </tr>
 <tr class="odd">
 <td align="left">5</td>
 <td align="left">Base_Color</td>
-<td align="right">0.0775</td>
+<td align="right">0.0766</td>
 </tr>
 <tr class="even">
 <td align="left">4</td>
 <td align="left">primary.breed.group</td>
-<td align="right">0.0683</td>
+<td align="right">0.0685</td>
 </tr>
 <tr class="odd">
 <td align="left">7</td>
 <td align="left">has_Name</td>
-<td align="right">0.0569</td>
+<td align="right">0.0578</td>
 </tr>
 <tr class="even">
 <td align="left">2</td>
 <td align="left">Sex</td>
-<td align="right">0.0471</td>
+<td align="right">0.0456</td>
 </tr>
 <tr class="odd">
 <td align="left">1</td>
 <td align="left">Type</td>
-<td align="right">0.0404</td>
+<td align="right">0.0381</td>
 </tr>
 <tr class="even">
 <td align="left">6</td>
 <td align="left">has_pattern</td>
-<td align="right">0.0211</td>
+<td align="right">0.0206</td>
 </tr>
 </tbody>
 </table>
 <p><strong>Held-out test set.</strong> The tuned model obtained a
-macro-F1 of 0.4815, a balanced accuracy of 0.5381 and an accuracy of
-0.6831, compared with 0.1376, 0.2000 and 0.5244 for the majority-class
+macro-F1 of 0.4738, a balanced accuracy of 0.5342 and an accuracy of
+0.6712, compared with 0.1376, 0.2000 and 0.5244 for the majority-class
 predictor. The test macro-F1 differs from the mean CV macro-F1 of the
-selected configuration by -0.0123.</p>
+selected configuration by -0.0175.</p>
 <p><strong>Feature importance.</strong> By split gain, Spayed.Neutered
-has the largest share (37.3%), followed by Age_Years_imputed (31.6%).
+has the largest share (37.5%), followed by Age_Years_imputed (31.8%).
 These shares describe the splits of the fitted trees only and are not a
 causal effect. ### Random Forest</p>
 <ol style="list-style-type: decimal">

@@ -921,9 +921,9 @@ prepare_features <- function(df) {
       ), levels = c("No", "Yes", "Unknown")),
 
       # 6. Breed / Colour: fixed text cleaning; frequency grouping is deferred.
-      #Primary.Breed = if_else(is_blank(Primary.Breed), "Unknown",
-      #                        trimws(as.character(Primary.Breed))),
-      Primary.Breed = fct_lump_min(as.factor(Primary.Breed), min = 10, other_level = "Other"),
+      Primary.Breed = if_else(is_blank(Primary.Breed), "Unknown",
+                              trimws(as.character(Primary.Breed))),
+      # Primary.Breed = fct_lump_min(as.factor(Primary.Breed), min = 10, other_level = "Other"),
       Base_Color = factor(case_when(
         is_blank(Primary.Color) ~ "Unknown",
         str_detect(Primary.Color, regex("brown|tan|choc|fawn|buff|sable|liver|cinnamon|rust|agouti|bronze|chestnut|sandy|seal", ignore_case = TRUE)) ~ "Brown/Tan",
