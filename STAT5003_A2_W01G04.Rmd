@@ -1,0 +1,463 @@
+---
+title: "Predicting Shelter Outcomes"
+subtitle: "STAT5003 Assignment 2"
+author: "W01G04"
+output:
+  html_document:
+    code_folding: hide
+    self_contained: true
+    theme: default
+    mathjax: null
+    css: report_support/report.css
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(message = FALSE, warning = FALSE, fig.align = "center",
+                      out.width = "100%", fig.width = 9, fig.height = 3.8, dpi = 150)
+# Native disclosure controls keep source closed even when JavaScript is disabled.
+knitr::knit_hooks$set(source = function(x, options) {
+  label <- if (is.null(options$fold_label)) "Show R code" else options$fold_label
+  paste0('<details class="r-source"><summary>', htmltools::htmlEscape(label), '</summary>',
+         '<pre class="fold-none"><code class="language-r">',
+         htmltools::htmlEscape(paste(x, collapse = "\n")),
+         '</code></pre></details>\n\n')
+})
+source("report_support/preprocessing.R")
+source("report_support/report_data.R")
+eda <- new.env(parent = globalenv())
+grDevices::pdf(NULL)
+invisible(capture.output(sys.source("report_support/eda_source.R", envir = eda)))
+grDevices::dev.off()
+eda_rate <- function(summary, level, outcome) {
+  pct(summary$Prop[summary$Level == level & summary$Outcome.Group == outcome])
+}
+model_source_env <- new.env(parent = globalenv())
+sys.source("report_support/model_code_sections.R", envir = model_source_env)
+model_code <- model_source_env$model_code
+theme_set(theme_minimal(base_size = 10))
+palette_outcome <- eda$outcome_colours
+```
+
+## 1. Problem Framing & Research Question
+
+### Task and motivation
+
+Animal shelters make care and placement decisions with limited space, staff and information. This study addresses a **five-class classification task**: predict Adoption, Transfer, Return, Euthanasia or Other from recorded characteristics of cats and dogs. The unit of analysis is each animal's latest recorded intake in the supplied extract. Predictors are intended to describe information available at admission; their actual recording times are a limitation assessed below.
+
+The motivation is to determine how much useful outcome information these characteristics contain and whether more flexible models improve on simple baselines. Overall accuracy alone is insufficient: a model that mostly recognises common outcomes can overlook animals in rarer outcome groups. We therefore compare macro-F1 and class-specific errors as well as accuracy.
+
+### Research question
+
+**To what extent can characteristics intended to be available at intake predict the five recorded shelter outcomes for each cat or dog's latest admission, and which fitted model offers the best balance of class-level performance?**
+
+### Stakeholders and intended use
+
+**Intake Triage Officers** need evidence to support early assessment and prioritise cases for staff review. Recall for less common outcomes indicates how often relevant cases are detected; precision indicates how often a flag is a false alarm. These predictions could supplement professional judgement, but they do not measure medical deterioration, length of stay or the appropriate treatment for an animal.
+
+**Transfer & Foster Coordinators** plan rescue-partner and foster placements under capacity constraints. Transfer predictions may help identify cases for placement review; a missed Transfer outcome and a false Transfer prediction have different practical costs. This study evaluates outcome classification, rather than forecasting placement dates or demonstrating reduced shelter stays.
+
+A predicted historical outcome is not a recommendation about what should happen to an animal. The analysis tests associations in historical records, and operational use would first require verified intake-time inputs and an assessment of errors in the intended setting.
+
+## 2. Dataset & Justification
+
+### Source and analytical scope
+
+We analysed the Austin Animal Center Outcomes extract from the City of Austin Open Data Portal (City of Austin, n.d.). The supplied file contains **`r comma(nrow(data))` records and `r ncol(data)` variables**. Selecting Dog, Puppy, Cat and Kitten yields **`r comma(nrow(data_selected))` records** for EDA; retaining each animal's latest recorded intake yields **`r comma(nrow(data_latest))` animals** for modelling. This prevents the same animal appearing in training and assessment data.
+
+### Evidence for the dataset criteria
+
+- **Large:** the final sample contains `r comma(nrow(data_latest))` animals, exceeding 10,000 even after restricting the scope and removing repeated admissions.
+- **Messy:** missing or blank names (`r fmt(quality_value("Name"), 1)`%), secondary colours (`r fmt(quality_value("Secondary.Color"), 1)`%) and birth dates (`r fmt(quality_value("Date.of.Birth"), 1)`%), inconsistent categorical labels and invalid ages require explicit cleaning. Figure 1 shows the missingness evidence.
+- **Multiclass:** five outcomes have substantially different frequencies. Figure 1 shows their distribution and why the evaluation must consider minority classes.
+
+### Outcome definition
+
+We consolidate `r dplyr::n_distinct(data_selected$Outcome.Status)` raw outcome labels into five operational groups. Adoption includes adoption variants; Transfer includes transfers out; Return includes reclaimed, redemption, return-to-owner and return-to-habitat records; Euthanasia includes euthanasia variants; Other contains the remaining death and administrative outcomes. Other is consequently a heterogeneous class.
+
+## 3. EDA & Insights
+
+### Data quality and outcome distribution
+
+EDA examines the **`r comma(nrow(data_selected))` selected records** using their original predictor values. Separate audit and plotting summaries describe missingness, inconsistencies and associations with `Outcome.Group`; selection of the final modelling sample and imputation begin in Data Preprocessing.
+
+The audit finds **`r comma(quality_checks$Count[quality_checks$Check == "Animal IDs with more than one record"])` Animal IDs with repeated records**, but **`r quality_checks$Count[quality_checks$Check == "Exact duplicate rows"]` exact duplicate rows**. Repeated Animal IDs may represent separate shelter episodes rather than duplicate records. There are `r sum(is.na(age_audit$Age_Years_raw))` unavailable ages and a further `r sum(age_audit$Age_Years_raw < 0, na.rm = TRUE)` negative ages. These are separate data-quality findings. Negative ages remain in the audit; their conversion to missing values is a later preprocessing decision. No nonblank birth or intake dates failed parsing.
+
+Adoption and Transfer account for `r pct(sum(group_summary$Count[group_summary$Outcome.Group %in% c("Adoption", "Transfer")]) / nrow(data_selected))` of selected records. A classifier can therefore achieve substantial accuracy while failing to recognise smaller outcome groups. Missingness is concentrated in secondary colour, name and birth date (Figure 1).
+
+```{r eda-distribution-and-missingness, fig.height=3.1}
+p_class <- ggplot(group_summary, aes(Outcome.Group, Percentage, fill = Outcome.Group)) +
+  geom_col(width = .68) + geom_text(aes(label = sprintf("%.1f%%", Percentage)), vjust = -.4, size = 3) +
+  scale_fill_manual(values = palette_outcome, guide = "none") +
+  scale_y_continuous(limits = c(0, 65), labels = function(x) paste0(x, "%")) +
+  labs(title = "Outcome distribution", x = NULL, y = "Share of selected records") +
+  theme(axis.text.x = element_text(angle = 20, hjust = 1))
+miss <- quality_summary %>% filter(Feature %in% c("Secondary.Color", "Name", "Date.of.Birth", "Sex", "Spayed.Neutered"))
+p_missing <- ggplot(miss, aes(reorder(Feature, Missing_pct), Missing_pct)) +
+  geom_col(fill = "#6E91A8", width = .65) + coord_flip() +
+  geom_text(aes(label = sprintf("%.1f%%", Missing_pct)), hjust = -.15, size = 3) +
+  scale_y_continuous(limits = c(0, 60)) + labs(title = "Missing or blank fields", x = NULL, y = "Percent")
+p_class + p_missing + patchwork::plot_annotation(caption = "Figure 1. Initial cat-and-dog subset, before selecting one admission per animal.")
+```
+
+```{r original-eda-source, eval=FALSE, fold_label="Show original EDA calculations and plotting source", code=readLines("report_support/eda_source.R")}
+```
+
+### Type, age and overlapping information
+
+Puppy and Kitten already describe life stage as well as species, so their relationship with observed age indicates overlapping information. The age summaries use only nonnegative observed ages, with missing and negative counts reported separately. Median ages are `r fmt(eda$type_age_summary$Median_age[eda$type_age_summary$Type == "Dog"], 2)` years for Dog and `r fmt(eda$type_age_summary$Median_age[eda$type_age_summary$Type == "Cat"], 2)` for Cat, compared with `r fmt(eda$type_age_summary$Median_age[eda$type_age_summary$Type == "Puppy"], 2)` for Puppy and `r fmt(eda$type_age_summary$Median_age[eda$type_age_summary$Type == "Kitten"], 2)` for Kitten.
+
+The distribution is severely right-skewed. Animals that were Adopted or Transferred skew noticeably younger, whereas those in the Return or Euthanasia groups skew older. The Return proportions are `r eda$outcome_rate("Type", "Dog", "Return")` for Dog, `r eda$outcome_rate("Type", "Puppy", "Return")` for Puppy, `r eda$outcome_rate("Type", "Cat", "Return")` for Cat and `r eda$outcome_rate("Type", "Kitten", "Return")` for Kitten. Alongside the age summaries, these differences motivate representing species and continuous age separately in the modelling dataset.
+
+```{r eda-age-and-species, fig.height=3.05}
+# Retain the original EDA plots and categories; adjust layout only.
+eda$p_age_outcome + eda$p_type_outcome +
+  patchwork::plot_annotation(caption = "Figure 2. Observed nonnegative age by outcome and outcome proportions within original Type labels.")
+```
+
+::: {.eda-figure-block}
+
+### Breed, colour and coat pattern
+
+There are `r nrow(eda$breed_summary)` distinct breed labels recorded; the top eight cover `r fmt(eda$breed_summary$Cum_Pct[8], 1)`% of selected records, while `r sum(eda$breed_summary$Count == 1)` labels occur only once. To limit sparse categories, Data Preprocessing retains the eight most common non-Unknown breeds identified in each training partition and groups all remaining or unseen breeds as Other.
+
+The original colour analysis uses a separate plotting copy: primary colours are grouped into base colours, and a non-empty secondary colour or patterned-coat keyword identifies Mixed rather than Pure. White/Cream animals show the highest Return proportion of any colour group, while Blue/Grey animals show a comparatively higher Euthanasia proportion. The additional pattern comparison shows Adoption proportions of `r eda_rate(eda$outcome_summary(eda$colour_eda, "has_pattern"), "Mixed", "Adoption")` for Mixed and `r eda_rate(eda$outcome_summary(eda$colour_eda, "has_pattern"), "Pure", "Adoption")` for Pure. These are associations between recorded categories and outcomes.
+
+```{r eda-breed-colour-pattern, fig.height=3.9, fig.cap="Figure 3. Original breed distribution and colour/pattern outcome proportions; sample sizes are shown with category labels."}
+# Original summaries and plotting functions; one shared legend saves space.
+p_breed <- eda$p_breed_elbow +
+  scale_x_continuous(breaks = c(8, 50, 100, nrow(eda$breed_summary))) +
+  labs(title = "Breed cumulative coverage", x = "Breed frequency rank", y = "Cumulative share")
+p_colour <- eda$plot_outcome(eda$colour_eda, "Base_Color", "Outcome by base colour") +
+  coord_flip() + theme(axis.text.x = element_text(angle = 0, hjust = .5),
+                       axis.text.y = element_text(angle = 0, hjust = 1))
+p_pattern <- eda$p_pattern_outcome + labs(title = "Outcome by coat pattern")
+(p_breed + p_colour + p_pattern +
+   patchwork::plot_layout(widths = c(1, 1.2, 1), guides = "collect")) &
+  theme(legend.position = "bottom", plot.title = element_text(size = 11.5),
+        axis.title = element_text(size = 10.5), axis.text = element_text(size = 10.5),
+        legend.title = element_text(size = 10.5), legend.text = element_text(size = 10.5),
+        legend.margin = margin(0, 0, 0, 0))
+```
+
+:::
+
+::: {.eda-figure-block}
+
+### Sex, spay/neuter status and name recording
+
+Sex and Spayed/Neutered contain blank values, and Spayed/Neutered additionally has inconsistent capitalisation (Yes and yes both appear and represent the same value). Both issues are corrected in Data Preprocessing; the plots below use the raw values to document what the inconsistency actually looks like before cleaning. Adoption proportions differ even between Yes (`r eda$outcome_rate("Spayed.Neutered", "Yes", "Adoption")`) and yes (`r eda$outcome_rate("Spayed.Neutered", "yes", "Adoption")`), so these patterns require attention to recording practices.
+
+EDA compares outcome proportions across observed name-recording conditions: non-placeholder text, placeholder text, blank text and NA. This is a missingness audit of Name, not construction of the binary has_Name predictor. Original names are retained; the binary modelling variable is created only in Data Preprocessing. The present subset has no NA names; the observed groups are shown with their sample sizes. Adoption accounts for `r eda_rate(eda$name_outcome_pct, "Recorded", "Adoption")` of the Recorded group and `r eda_rate(eda$name_outcome_pct, "Blank", "Adoption")` of the Blank group.
+
+```{r eda-recording-outcomes, fig.height=3.5, fig.cap="Figure 4. Raw sex/neuter labels and name-recording groups, with group sizes; no imputation or label standardisation in EDA."}
+p_sex <- eda$plot_outcome(eda$data_eda, "Sex", "Outcome by recorded sex")
+p_neuter <- eda$plot_outcome(eda$data_eda, "Spayed.Neutered", "Outcome by spay/neuter status")
+p_name <- eda$p_name_outcome + labs(title = "Outcome by name recording")
+# Horizontal bars leave room for larger, unrotated category and sample-size labels.
+readable_outcomes <- function(p) {
+  p + coord_flip() +
+    scale_y_continuous(breaks = c(0, .5, 1), labels = scales::percent,
+                       expand = expansion(mult = c(0, .02))) +
+    theme(axis.text.x = element_text(angle = 0, hjust = .5),
+          axis.text.y = element_text(angle = 0, hjust = 1))
+}
+(readable_outcomes(p_sex) + readable_outcomes(p_neuter) + readable_outcomes(p_name) +
+   patchwork::plot_layout(guides = "collect")) &
+  theme(legend.position = "bottom", plot.title = element_text(size = 11.5),
+        axis.title = element_text(size = 10.5), axis.text = element_text(size = 10.5),
+        legend.title = element_text(size = 10.5), legend.text = element_text(size = 10.5),
+        legend.margin = margin(0, 0, 0, 0))
+```
+
+:::
+
+Differences between these recording groups may reflect administrative practices or prior ownership information. This comparison cannot establish those explanations or confirm that names were available at intake. Type already contains age-related labels; breed and colour have many categories; date differences include missing and negative values; and Sex, Spayed/Neutered and Name contain recording issues. These findings motivate the explicit preprocessing choices in the next section. The class imbalance supports macro-F1 and per-class recall, while predictive value is assessed using shared cross-validation splits. EDA uses the full selected subset and is not independent performance evidence.
+
+## 4. Data Preprocessing
+
+We retain the latest intake timestamp for each animal, resolving ties by source row order. This removes `r comma(nrow(data_selected) - nrow(data_latest))` additional records without using the outcome to choose an admission. A stratified 80/20 split with seed 5003 gives **`r comma(length(y_train))` training animals and `r comma(length(y_test))` test animals**. Five outcome-stratified folds within training are shared by all models. Animal IDs are used only for grouping and checks.
+
+| Predictor | Implemented treatment |
+|:--|:--|
+| Species | Recode Puppy to Dog and Kitten to Cat. |
+| Age at intake | Calendar-day difference between intake and birth, divided by 365; negative values become missing. Impute from the training median within species, with an overall training-median fallback. |
+| Sex; spayed/neutered | Trim and standardise labels; represent missing or unrecognised values as Unknown. |
+| Primary breed | Retain the eight most frequent non-Unknown breeds in the training partition; group the rest and unseen breeds as Other. |
+| Base colour; pattern | Apply fixed text rules to colour fields; pattern indicates a recorded secondary colour or patterned-coat keyword. |
+| Name recorded | Binary indicator; blank, missing and placeholder names are coded absent. |
+
+Outcome date/status, euthanasia reason, completed days in shelter, identifiers and administrative timestamps are excluded from predictors. Raw names, dates and text are replaced by their derived features. Imputation and breed grouping are re-estimated within each training fold, then applied to validation rows. Model-specific encoding and age transformations also use the corresponding training rows. Name, neutering status and the colour indicators remain recording-based proxies whose availability at admission requires verification.
+
+```{r shared-preprocessing-code, eval=FALSE, code=readLines("report_support/preprocessing.R")}
+```
+
+## 5. Model Fitting
+
+### Common fitting procedure
+
+Four fitted classifiers use the same eight core predictors and shared five-fold partitions. For each fold, preprocessing is learned from its training rows, the model is fitted to those rows, and predictions are recorded for the validation rows. Combining these predictions gives one out-of-fold prediction per training animal. Hyperparameters and feature changes are evaluated in Section 6; model comparison is reported in Section 7. The folded panels below contain the actual fitting source; each model's Section 6 panel contains its tuning, prediction and result-export code. Tables are calculated from those workflows' saved outputs. XGBoost was rerun for this report; the other three models use existing outputs checked against the available predictions and fold summaries. Rendering the report does not retrain the model grids. The decision-tree model is excluded from this review because its fitted results are not yet available.
+
+### Majority class (baseline)
+
+The common reference baseline predicts the most frequent training class for every animal, without using predictors. It is **Adoption** in each training fold. The majority class accounts for `r pct(max(prop.table(table(y_train))), 2)` of the full training partition, while the smallest class, Other, accounts for `r pct(min(prop.table(table(y_train))), 2)`.
+
+On the training labels, this rule achieves accuracy `r fmt(majority_training$Accuracy)` and weighted-F1 `r fmt(majority_training$Weighted_F1)`, but macro-F1 only `r fmt(majority_training$Macro_F1)` and balanced accuracy 0.200. This illustrates why prevalence-weighted scores can look substantial even when four outcomes are never predicted. The comparison table evaluates this baseline on validation folds, selecting the majority from each fold's training labels. It is a reference rule, separate from the four fitted model families and their own initial configurations.
+```{r majority-fitting-source, eval=FALSE, fold_label="Show majority-baseline calculation code", code=model_code$majority_fit}
+```
+
+
+### Multinomial logistic regression
+
+The initial M0 model is fitted with `nnet::multinom`, using treatment-coded categories and training-standardised age. It estimates class probabilities through linear predictors for the class log-odds and assigns the class with the largest probability. This provides a relatively interpretable baseline for assessing whether nonlinear models add predictive value. Regularisation, class weights and nonlinear age features are evaluated in Section 6; the resulting M3 model is fitted with `glmnet`.
+```{r logistic-fitting-source, eval=FALSE, fold_label="Show logistic regression fitting and baseline CV code", code=model_code$lr_fit}
+```
+
+
+### Random forest
+
+Random Forest combines many decision trees to capture non-linear relationships and reduce the variance of a single tree. We use the same eight predictors as the other models, keeping categorical variables as factors and age on its original scale.
+
+**Baseline model.** We first fit a Random Forest with default settings: 500 trees and two randomly selected predictors at each split. No class weights are applied. Performance is assessed using macro-F1, balanced accuracy (mean class recall), and overall accuracy.
+
+The original baseline code below fits the full training partition and predicts the holdout. Section 6 compares the baseline and tuned settings using the shared validation folds; its reported CV scores do not come from these holdout predictions.
+
+```{r rf-fitting-source, eval=FALSE, fold_label="Show random forest baseline and fold-fitting code", code=model_code$rf_fit}
+```
+
+
+### Radial-basis support vector machine
+
+We fitted a radial-basis-function support vector machine using `e1071::svm()` with one-versus-one multiclass classification (Chang & Lin, 2011). The eight predictors were `Type`, `Sex`, `Spayed.Neutered`, `primary.breed.group`, `Base_Color`, `has_pattern`, `has_Name`, and `Age_Years_imputed`. Each animal contributed its latest recorded intake only. We used the shared outcome-stratified split and five cross-validation folds (seed 5003) described in Section 4.
+
+Within each fold, the common preprocessing estimated species-specific median ages and the eight most frequent breeds from that fold's training data. The SVM then fitted a full one-hot encoder, removed training-constant columns, and standardised age using the training mean and standard deviation. Binary indicators remained 0/1. Internal SVM scaling was disabled to avoid scaling the same inputs twice. Assessment-only categories were represented by an all-zero block, preserving row alignment. No encoding or scaling parameters were learned from validation data.
+
+The baseline used `C = 1`, `gamma = 1/p`, and no class weights, where `p` is the number of retained encoded predictors.
+
+```{r svm-fitting-source, eval=FALSE, fold_label="Show SVM encoding and fitting code", code=model_code$svm_fit}
+```
+
+
+### XGBoost
+
+We use XGBoost as a non-linear model for the classification. It benchmarks the non-linear predictive signal extractable beyond the linear baseline. We use the same predictor set as the multinomial baseline, one-hot encoded into a numeric design matrix for xgboost. Continuous Age_Years_imputed remains unstandardised, as tree-based partition algorithms are invariant to monotonic scaling (Hastie et al., 2009).
+
+XGBoost is fitted with `xgboost::xgb.train`, using the five-class `multi:softprob` objective (Chen & Guestrin, 2016). The predicted class has the largest fitted probability. All configurations use **150 boosting rounds**, seed 5003 and no early stopping. **Configuration A is the XGBoost model baseline:** depth 6, learning rate 0.3 and no class weights; the row/column sampling fractions and minimum child weight retain their defaults of 1.
+
+```{r xgb-fitting-source, eval=FALSE, fold_label="Show XGBoost encoding, fitting and baseline CV code", code=model_code$xgb_fit}
+```
+
+## 6. Model Improvement
+
+All improvement choices use the shared training folds and mean CV macro-F1. The test partition does not determine weights, feature transformations or hyperparameters in these procedures. The following comparisons show both the improvement attempted and its measured effect.
+
+### Multinomial logistic regression
+
+Starting from the M0 baseline, M1 adds inverse-frequency observation weights, w<sub>c</sub> = n/(5n<sub>c</sub>), computed from training labels. M2 adds a grouped elastic-net penalty. M3 replaces linear age with a three-degree-of-freedom natural spline of log(1 + age), adds a Dog × standardised log(1 + age) interaction, and includes an age-missing indicator. This allows age relationships to vary across species while controlling unstable coefficients.
+
+For M2 and M3, α ∈ {0, 0.25, 0.5, 0.75, 1} is compared along a path of up to 40 regularisation strengths. The path is generated from the full training partition; fold models estimate preprocessing and coefficients separately. After finding the best α, the largest λ within one standard error of its best mean macro-F1 is retained. The selected M3 uses α = 0.5, λ ≈ 0.026. Grouped shrinkage can remove encoded columns across classes; it does not necessarily remove a whole original categorical variable.
+
+```{r logistic-improvement, fold_label="Show logistic regression results-table code"}
+knitr::kable(lr_cv[match(c("M0 multinom", "M1 multinom + weights", "M2 glmnet + weights", "M3 glmnet + weights + age features"), lr_cv$Model),
+                  c("Model", "macro_F1", "balanced_accuracy", "accuracy")],
+             digits = 3, row.names = FALSE,
+             col.names = c("Specification", "CV macro-F1", "Balanced accuracy", "Accuracy"),
+             caption = "Table 1. Logistic model improvement, means over the shared five folds.")
+```
+
+M3 raises mean macro-F1 from `r fmt(lr_base$macro_F1)` to `r fmt(lr_selected$macro_F1)`, while reducing accuracy from `r fmt(lr_base$accuracy)` to `r fmt(lr_selected$accuracy)`. This reflects greater attention to uncommon outcomes rather than a uniform improvement in prediction.
+```{r logistic-tuning-source, eval=FALSE, fold_label="Show logistic regression tuning, prediction and export code", code=model_code$lr_improvement}
+```
+
+
+### Random forest
+
+We tune the number of trees (`num.trees`: 100, 300, 500) and the number of predictors considered at each split (`mtry`: 2, 4, 8). All other settings remain at their defaults. Each combination is evaluated using the shared five-fold cross-validation data, and the combination with the highest mean macro-F1 is selected. Test results are not used to choose the parameters.
+
+```{r rf-improvement-results, fold_label="Show random forest results-table code"}
+rf_rows <- rbind(rf_base, rf_selected)
+rf_display <- data.frame(
+  Configuration = c("Unweighted baseline", "Selected by CV"),
+  Trees = rf_rows$num.trees, mtry = rf_rows$mtry,
+  `CV macro-F1` = rf_rows$Mean_Macro_F1,
+  `Balanced accuracy` = rf_rows$Mean_Balanced_Accuracy,
+  Accuracy = rf_rows$Mean_Accuracy, check.names = FALSE)
+knitr::kable(rf_display, digits = 3, row.names = FALSE,
+  caption = "Table 2. Random forest: baseline and selected configuration on the same five folds.")
+```
+
+The selected **500-tree, mtry = 4** model increases mean macro-F1 from `r fmt(rf_base$Mean_Macro_F1)` to `r fmt(rf_selected$Mean_Macro_F1)`. No class weights are used.
+
+```{r rf-tuning-source, eval=FALSE, fold_label="Show random forest full CV, selection and export code", code=model_code$rf_improvement}
+```
+
+
+### Radial-basis support vector machine
+
+A grid compared `C` in {0.1, 1, 10}, gamma multipliers in {0.25, 1, 4} applied to `1/p`, and unweighted versus inverse-frequency-weighted training: 18 configurations and 90 fold fits. Inverse weights were calculated from the current training partition as `n / (K * n_class)`, so their mean per observation was one. We selected the configuration with the highest mean fold macro-F1, breaking ties by lower fold standard deviation and then lower cost and gamma multiplier.
+
+The selected configuration was **C = `r svm_selected$C`, gamma = `r svm_selected$Gamma_multiplier`/p, weighting = `r svm_selected$Weighting`**. Its mean CV macro-F1 was **`r fmt(svm_selected$Mean_Macro_F1)`**, compared with **`r fmt(svm_base$Mean_Macro_F1)`** for the baseline, a change of **`r sprintf("%+.3f", svm_selected$Mean_Macro_F1 - svm_base$Mean_Macro_F1)`**.
+
+```{r svm-improvement-results, fold_label="Show SVM results-table code"}
+svm_weighted <- read_result("best_weighted_cv.csv", "SVM_week12/svm_results")
+svm_columns <- c("C", "Gamma_multiplier", "Weighting", "Mean_Macro_F1", "Mean_Balanced_Accuracy", "Mean_Accuracy")
+svm_rows <- rbind(svm_base[, svm_columns], svm_selected[, svm_columns], svm_weighted[, svm_columns])
+svm_display <- data.frame(
+  Configuration = c("Unweighted baseline", "Selected by CV", "Best weighted candidate"),
+  C = svm_rows$C, Gamma = paste0(svm_rows$Gamma_multiplier, "/p"),
+  `CV macro-F1` = svm_rows$Mean_Macro_F1,
+  `Balanced accuracy` = svm_rows$Mean_Balanced_Accuracy,
+  Accuracy = svm_rows$Mean_Accuracy, check.names = FALSE)
+knitr::kable(svm_display, digits = 3, row.names = FALSE,
+  align = c("l", "r", "r", "r", "r", "r"),
+  caption = "Table 3. SVM: baseline, selected model and best weighted alternative on the same five folds.")
+```
+
+The best inverse-weighted configuration had mean CV macro-F1 **`r fmt(svm_weighted$Mean_Macro_F1)`**, versus **`r fmt(svm_selected$Mean_Macro_F1)`** for the selected model. A small difference in mean macro-F1 does not establish superiority.
+
+```{r svm-tuning-source, eval=FALSE, fold_label="Show SVM full CV, selection, refit and export code", code=model_code$svm_improvement}
+```
+
+
+### XGBoost
+
+For configurations B and C, each training row receives the weight n / (K × n<sub>c</sub>) (training rows n, classes K = 5, rows in the row's class n<sub>c</sub>), passed to `xgb.DMatrix`. Every class then carries the same total weight, n / K, in the training loss. Weights are computed from the training rows of each fold (and from the full training set for the final model) only.
+
+Four hyperparameters are tuned by grid search: tree depth (`max_depth`: 4, 6), learning rate (`eta`: 0.05, 0.10), the fraction of columns sampled per tree (`colsample_bytree`: 0.70, 0.85) and the minimum child weight (`min_child_weight`: 1, 3). These control model complexity and the degree of regularisation of the boosted trees (Chen & Guestrin, 2016). For the tuned configurations, the row sampling fraction (`subsample`) is fixed at 0.80 and the number of boosting rounds at 150. Each of the 16 configurations is evaluated on the five shared folds in `cv_data`, and the one with the highest mean macro-F1 is selected. To separate the effect of the weights from the effect of tuning, the results below compare three configurations on the same folds: (A) library defaults without weights, (B) library defaults with balanced weights, and (C) the tuned configuration with balanced weights.
+
+```{r xgboost-improvement, fold_label="Show XGBoost results-table code"}
+xgb_display <- xgb_cv
+xgb_display$Configuration <- c("A. Unweighted model baseline", "B. Baseline + balanced weights", "C. Tuned + balanced weights")
+knitr::kable(xgb_display[, c("Configuration", "Mean_CV_Macro_F1", "SD_CV_Macro_F1", "Mean_CV_Balanced_Accuracy", "Mean_CV_Accuracy")],
+             digits = 3, col.names = c("Configuration", "Macro-F1", "Fold SD", "Balanced accuracy", "Accuracy"),
+             caption = "Table 4. XGBoost weighting and tuning on identical folds and 150-round budgets.")
+```
+
+The selected configuration (`max_depth` = `r xgb_selected$max_depth`, `eta` = `r xgb_selected$eta`, `colsample_bytree` = `r xgb_selected$colsample_bytree`, `min_child_weight` = `r xgb_selected$min_child_weight`) reached a mean macro-F1 of `r fmt(xgb_selected$Mean_CV_Macro_F1)` (SD `r fmt(xgb_selected$SD_CV_Macro_F1)`). Adding balanced weights changed mean macro-F1 from `r fmt(xgb_cv$Mean_CV_Macro_F1[1])` (A) to `r fmt(xgb_cv$Mean_CV_Macro_F1[2])` (B), and mean accuracy from `r fmt(xgb_cv$Mean_CV_Accuracy[1])` to `r fmt(xgb_cv$Mean_CV_Accuracy[2])`. Tuning changed mean macro-F1 from `r fmt(xgb_cv$Mean_CV_Macro_F1[2])` (B) to `r fmt(xgb_cv$Mean_CV_Macro_F1[3])` (C). Because the selected value is the maximum over 16 candidates, it is the selection criterion and not an independent performance estimate; the held-out result in Section 8 is reported separately.
+
+```{r xgb-tuning-source, eval=FALSE, fold_label="Show XGBoost weighting, grid search and export code", code=model_code$xgb_improvement}
+```
+
+## 7. Model Evaluation & Selection
+
+### Evaluation metrics
+
+For class c, precision = TP/(TP + FP), recall = TP/(TP + FN), and F1 = 2TP/(2TP + FP + FN), using that class's true positives, false positives and false negatives. Precision and F1 are defined as zero when a class is never predicted. **Macro-F1** is the unweighted mean of the five class F1 scores and is the primary selection measure. **Balanced accuracy** is mean class recall; overall accuracy is secondary. Weighted-F1 weights each class F1 by prevalence and can conceal poor minority-class performance.
+
+### Cross-validated comparison
+
+Table 5 reports the mean of the five fold scores and the SD of macro-F1. Figure 5 pools one out-of-fold prediction per training animal for class-specific recall. All models use the same animal assignments, target labels and folds. The folds are also used for tuning, so these are selection results, not unbiased estimates from nested cross-validation. Fold SD describes variation across these folds; it is not a confidence interval.
+
+```{r cv-comparison}
+comparison_display <- comparison %>% transmute(Model,
+  `Macro-F1 (mean ± SD)` = sprintf("%.3f ± %.3f", Macro_F1, SD),
+  `Balanced accuracy` = fmt(Balanced_Accuracy), Accuracy = fmt(Accuracy))
+knitr::kable(comparison_display, align = c("l", "r", "r", "r"), caption = "Table 5. Shared five-fold validation; macro-F1 is the selection criterion.")
+```
+
+```{r class-recall-comparison, fig.height=3.4}
+ggplot(recall_long, aes(Class, Recall, fill = Model)) +
+  geom_col(position = position_dodge(width = .8), width = .75) +
+  scale_fill_manual(values = c("#3578A3", "#5A9975", "#B98342", "#8270A1")) +
+  scale_y_continuous(limits = c(0, 1), labels = scales::percent) +
+  labs(x = NULL, y = "Recall", fill = NULL,
+       caption = "Figure 5. Pooled out-of-fold recall for all four models; each animal is predicted outside its training fold.") +
+  theme(legend.position = "bottom")
+```
+
+**XGBoost is selected among the four completed models.** Its mean macro-F1 of `r fmt(xgb_selected$Mean_CV_Macro_F1)` exceeds random forest by `r fmt(xgb_selected$Mean_CV_Macro_F1 - rf_selected$Mean_Macro_F1)`; this small difference is not evidence of a decisive advantage. The practical distinction is its greater recall for Euthanasia and Other. Random forest and SVM achieve about 0.80 accuracy but identify few Euthanasia cases. Logistic M3 has lower macro-F1, although its stronger Return and Other recall makes it informative when missed cases are a priority.
+
+XGBoost's lower accuracy (`r fmt(xgb_selected$Mean_CV_Accuracy)`) is a trade-off: improved attention to rare outcomes comes with more errors among common outcomes. Macro-F1 balances class precision and recall but does not encode a shelter's actual error costs. Staff would need to determine those costs before adopting a model or decision threshold.
+
+## 8. Final Results & Conclusion
+
+### Held-out assessment
+
+After CV selection, the chosen XGBoost configuration is refitted on all `r comma(length(y_train))` training animals for the same 150 rounds and evaluated on the `r comma(length(y_test))` test animals. Test labels do not determine parameters or the number of rounds in this procedure. Earlier project versions had already reported results on this split; this is a reproduced assessment, not a newly blinded test.
+
+```{r xgb-final-fitting-source, eval=FALSE, fold_label="Show final XGBoost refit, test predictions and importance code", code=model_code$xgb_final}
+```
+
+```{r holdout-overall}
+holdout_table <- data.frame(Model = c("Selected XGBoost", "Majority class (baseline)"),
+  `Macro-F1` = c(xgb_holdout$Macro_F1, majority_holdout$Macro_F1),
+  `Balanced accuracy` = c(xgb_holdout$Balanced_Accuracy, majority_holdout$Balanced_Accuracy),
+  Accuracy = c(xgb_holdout$Accuracy, majority_holdout$Accuracy), check.names = FALSE)
+knitr::kable(holdout_table, digits = 3, caption = "Table 6. Assessment on the same held-out animals.")
+knitr::kable(xgb_test_pc, digits = 3, col.names = c("Outcome", "Animals", "Precision", "Recall", "F1"),
+             caption = "Table 7. Selected XGBoost: per-class held-out performance.")
+```
+
+```{r holdout-confusion, fig.height=3.4}
+test_predictions <- read_result("xgb_holdout_predictions.csv")
+confusion <- as.data.frame(table(Actual = factor(test_predictions$Actual, levels = classes),
+                                Predicted = factor(test_predictions$Predicted, levels = classes))) %>%
+  group_by(Actual) %>% mutate(Share = Freq / sum(Freq))
+ggplot(confusion, aes(Predicted, Actual, fill = Share)) +
+  geom_tile(colour = "white") + geom_text(aes(label = Freq), size = 3.2) +
+  scale_fill_gradient(low = "#f1f5f8", high = "#37749b", labels = scales::percent) +
+  scale_y_discrete(limits = rev(classes)) +
+  labs(fill = "Row share", caption = "Figure 6. Held-out confusion matrix. Cell labels are animal counts; colour shows the share within each actual class.") +
+  theme(panel.grid = element_blank())
+```
+
+Held-out macro-F1 is **`r fmt(xgb_holdout$Macro_F1)`**, compared with `r fmt(xgb_selected$Mean_CV_Macro_F1)` in CV and `r fmt(majority_holdout$Macro_F1)` for the majority rule. Euthanasia recall is `r pct(xgb_test_pc$Recall[xgb_test_pc$Class == "Euthanasia"])` and precision is `r pct(xgb_test_pc$Precision[xgb_test_pc$Class == "Euthanasia"])`: many actual cases are missed, and many predictions of this outcome are false positives. The model therefore cannot determine an individual animal's care or disposition.
+
+### Interpretation and process reflection
+
+Aggregating split gain over one-hot columns identifies **`r xgb_importance$Predictor[1]`** (`r pct(xgb_importance$Gain[1])` of total gain) and **`r xgb_importance$Predictor[2]`** (`r pct(xgb_importance$Gain[2])`) as the two largest contributors. Gain describes how the fitted trees split this dataset. Correlated predictors can share importance, and these values neither establish causation nor show that a field was available at intake.
+
+```{r predictor-importance}
+predictor_names <- c(Spayed.Neutered = "Spayed/neutered", Age_Years_imputed = "Age at intake",
+  Base_Color = "Base colour", primary.breed.group = "Primary breed", has_Name = "Name recorded",
+  Sex = "Sex", Type = "Species", has_pattern = "Coat pattern")
+importance_table <- data.frame(
+  Predictor = unname(predictor_names[xgb_importance$Predictor[1:4]]),
+  `Gain share` = pct(xgb_importance$Gain[1:4]),
+  `Predictor ` = unname(predictor_names[xgb_importance$Predictor[5:8]]),
+  `Gain share ` = pct(xgb_importance$Gain[5:8]), check.names = FALSE)
+knitr::kable(importance_table, align = c("l", "r", "l", "r"),
+  caption = "Table 8. Selected XGBoost: share of split gain, aggregated across each predictor's encoded columns.")
+```
+
+The Data Investigation Process connected the audit to implementation: repeated identifiers led to one record per animal, sparse breeds to training-based grouping, and imbalance to macro-F1 and per-class error analysis. Comparing unweighted, weighted and tuned models showed why a plausible adjustment does not necessarily improve the chosen metric. Shared folds allowed a consistent comparison; a stronger evaluation would fix the complete protocol before examining assessment results and reserve a later period for testing.
+
+### Answer to the research question and limitations
+
+Recorded animal characteristics provide useful but incomplete information about shelter outcomes. Among the four completed classifiers, tuned weighted XGBoost has the highest mean CV macro-F1. Its held-out macro-F1 is `r fmt(xgb_holdout$Macro_F1)`. Its small advantage over random forest and its lower overall accuracy make the choice dependent on the importance of recognising less common outcomes. The results support further evaluation as an aid to staff review, rather than automated outcome decisions.
+
+The largest practical concern is prediction-time availability. In the logistic sensitivity analysis, excluding spay/neuter status reduces mean CV macro-F1 from `r fmt(lr_selected$macro_F1)` to `r fmt(lr_sensitivity$macro_F1[grepl("^CV without Spayed.Neutered$", lr_sensitivity$Check)])`; excluding both that field and name reduces it to `r fmt(lr_sensitivity$macro_F1[grepl("^CV without Spayed.Neutered \\+ has_Name$", lr_sensitivity$Check)])`. This dependence does not prove leakage, but it makes verification of intake-time values essential. The same sensitivity checks have not been established for XGBoost.
+
+Other limitations are the heterogeneous Other class, EDA conducted before the split, tuning and ranking on the same folds, and a target population restricted to the latest recorded admission per animal. A random split from one shelter does not establish performance in later periods or other shelters. Future work should verify field timestamps, evaluate a later admission cohort, and assess calibration and stakeholder-defined error costs before operational use.
+
+## References
+
+Chang, C.-C., & Lin, C.-J. (2011). LIBSVM: A library for support vector machines. *ACM Transactions on Intelligent Systems and Technology, 2*(3), Article 27. https://doi.org/10.1145/1961189.1961199
+
+Chen, T., & Guestrin, C. (2016). XGBoost: A scalable tree boosting system. In *Proceedings of the 22nd ACM SIGKDD International Conference on Knowledge Discovery and Data Mining* (pp. 785–794). Association for Computing Machinery. https://doi.org/10.1145/2939672.2939785
+
+City of Austin. (n.d.). *Austin Animal Center outcomes* [Data set]. City of Austin Open Data Portal. Retrieved September 20, 2026, from https://data.austintexas.gov/d/gsvs-ypi7
+
+Hastie, T., Tibshirani, R., & Friedman, J. (2009). *The elements of statistical learning: Data mining, inference, and prediction* (2nd ed.). Springer. https://doi.org/10.1007/978-0-387-84858-7
+
+## AI use statement
+
+OpenAI Codex (GPT-5.6 and GPT-6, OpenAI, https://openai.com/codex/) assisted with R code review, data-processing checks, report organisation, wording and HTML formatting. The report contains AI-assisted text and code; the analysis and submission remain the group's responsibility.
+
+## Reproducibility
+
+Figures are embedded in this HTML and all source panels are collapsed by default. Sections 4–8 show preprocessing, model fitting, tuning, prediction, evaluation and export code alongside the results they support. The accompanying source package retains the complete model files and data. The commands below regenerate each model's outputs, verify the results and render the report; they are not run during ordinary report rendering. R session information is included for SVM and the XGBoost run; reruns under other package versions can differ numerically.
+
+```{r reproduce, eval=FALSE, fold_label="Show commands to reproduce the models and report"}
+# Run from the project root after installing the documented R packages.
+# Rebuild each original model workflow, retaining its expected working directory.
+rmarkdown::render("zilan/logistic_regression.Rmd")
+source("model_comparison/run_rf_cv.R")
+local({
+  previous_directory <- setwd("SVM_week12")
+  on.exit(setwd(previous_directory))
+  source("run_svm.R")
+})
+source("model_comparison/run_xgb_review.R")
+source("report_support/verify_results.R")
+rmarkdown::render("STAT5003_A2_W01G04.Rmd")
+```

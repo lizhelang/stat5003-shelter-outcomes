@@ -1,63 +1,46 @@
 # STAT5003 Group Project – Predicting Shelter Outcomes (W01G04)
 
-R Markdown report for the STAT5003 Assignment 2 group project (Austin Animal Center outcomes, multi-class classification).
+R Markdown report for the STAT5003 Assignment 2 group project, using Austin Animal Center outcomes for five-class classification.
 
-- `STAT5003_group_project_RMarkdown_template_v29.Rmd` – main report (knit to HTML in RStudio).
-- `Austin_Animal_Center_Outcomes_20260916.csv` – dataset read by the Rmd (keep it in the same folder as the Rmd / repo root).
-- `model_comparison/` – shared CV comparison tables/figures for Section 7, plus final XGBoost holdout exports.
+## Current report
 
-Shared preprocessing produces `x_train`, `y_train`, `x_test`, `y_test` and `cv_data` (5 CV folds, seed 5003); each member adds their model section using these.
+- [HTML report](STAT5003_A2_W01G04.html): download and open in a browser; figures are embedded and code is collapsed by default.
+- [Report source](STAT5003_A2_W01G04.Rmd): the current report entry point.
+- [A4 PDF preview](STAT5003_A2_W01G04_preview.pdf): the reviewed 10-page layout, including references and the AI statement. The HTML contains expandable code.
+- `report_support/`: preprocessing, EDA, source-code display, result verification and report styling.
+- `model_comparison/review_results/`: the results used by the current report.
 
-## Render
+The report compares logistic regression, random forest, SVM and XGBoost, with a majority-class baseline. Decision-tree results remain unavailable.
 
-From the **repository root**:
+## Render from saved results
 
-```r
-rmarkdown::render("STAT5003_group_project_RMarkdown_template_v29.Rmd")
-```
-
-Requires tidyverse-style packages used in the Rmd (`dplyr`, `ggplot2`, `caret`, `lubridate`, `patchwork`, …). XGBoost scripts also need `xgboost` (this environment uses `~/R/library`).
-
-## Final XGBoost holdout (full-train refit + one test score)
-
-After CV selection, the selected XGBoost is refit once on the full training set and scored once on the untouched holdout. Run from the **repository root** (so `Austin_Animal_Center_Outcomes_20260916.csv` and `model_comparison/` resolve correctly):
-
-```bash
-cd /path/to/stat5003-shelter-outcomes   # repository root
-Rscript model_comparison/run_xgb_holdout.R
-```
-
-Or in R:
+Run from the **repository root**:
 
 ```r
-setwd("/path/to/stat5003-shelter-outcomes")  # repository root
-source("model_comparison/run_xgb_holdout.R")
+rmarkdown::render("STAT5003_A2_W01G04.Rmd")
 ```
 
-**Inputs (must already exist):**
+Rendering uses the saved results and does not retrain the model grids. Keep `Austin_Animal_Center_Outcomes_20260916.csv`, the model directories, and `report_support/` in place. Required R packages are listed in [report_support/README.txt](report_support/README.txt).
 
-| Path | Role |
-|------|------|
-| `Austin_Animal_Center_Outcomes_20260916.csv` | Raw data (same as the Rmd; script rebuilds the v29 split) |
-| `model_comparison/run_xgb_cv.R` | Shared preprocessing block (sourced up to the CV section) |
-| `model_comparison/results/xgb_selected_metrics.csv` | Selected hyper-parameters from unified CV |
-| `model_comparison/results/xgb_selected_oof_fold_scores.csv` | Fold `best_nrounds` → freeze `nrounds = round(mean(...))` (= 184) |
+## Verify or regenerate the model results
 
-**Protocol:** same hyper-parameters as the unified CV OOF; `nrounds` frozen at the mean OOF early-stopped iteration; **holdout is never used for early stopping or tuning**.
-
-**Outputs written under `model_comparison/results/`:**
-
-| File | Contents |
-|------|----------|
-| `xgb_holdout_metrics.csv` | Holdout macro-F1, balanced accuracy, accuracy, `nrounds`, hyper-params |
-| `xgb_holdout_per_class.csv` | Per-class precision / recall / F1 on holdout |
-| `xgb_holdout_predictions.csv` | Row-wise actual vs predicted on holdout |
-| `xgb_protocol.txt` | Short protocol note (CV + holdout) |
-
-To regenerate the CV selection artefacts first (slow; only if you change the grid):
+Check the saved predictions, metrics, animal assignments and shared folds:
 
 ```bash
-Rscript model_comparison/run_xgb_cv.R
+Rscript report_support/verify_results.R
 ```
 
-See also `model_comparison/README.md`.
+To regenerate the current XGBoost results, then verify them:
+
+```bash
+Rscript model_comparison/run_xgb_review.R
+Rscript report_support/verify_results.R
+```
+
+The current XGBoost workflow compares unweighted defaults, weighted defaults and a weighted parameter grid on the same five folds. All configurations and the final full-training refit use **150 rounds, without early stopping**. The selected model is evaluated on the existing held-out partition. This reproduces the assessment on an already examined dataset; it is not a newly blinded test.
+
+Logistic regression, random forest and SVM retain their original implementations and saved results. See [model_comparison/README.md](model_comparison/README.md), [zilan/README.md](zilan/README.md) and [SVM_week12/README.md](SVM_week12/README.md) for their workflows. The report's final folded code panel also lists the commands to reproduce the models and report.
+
+## Retained earlier files
+
+`STAT5003_group_project_RMarkdown_template_v29.Rmd` and its HTML are retained as the earlier report. The template is still a preprocessing dependency of existing model scripts; do not remove it. The earlier XGBoost scripts (`run_xgb_cv.R`, `run_xgb_holdout.R`) and `model_comparison/results/` are also retained. Their early-stopping protocol and 184-round final refit do not supply the current report's XGBoost results.

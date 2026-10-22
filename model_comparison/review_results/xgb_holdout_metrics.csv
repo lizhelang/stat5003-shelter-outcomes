@@ -1,0 +1,2 @@
+"Model","nrounds","Macro_F1","Balanced_Accuracy","Accuracy","Weighted_F1"
+"XGBoost",150,0.47756054628786,0.533777775525347,0.678359096313912,0.711921749045469

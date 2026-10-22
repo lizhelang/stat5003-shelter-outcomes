@@ -1,0 +1,39 @@
+body { color:#18212b; font-size:14px; line-height:1.5; }
+.main-container { max-width:1000px; }
+h1.title { font-size:29px; margin-bottom:8px; }
+h1,h2,h3 { color:#182f46; }
+h2 { font-size:23px; margin-top:28px; }
+h3 { font-size:18px; margin-top:20px; }
+h4 { font-size:16px; }
+table { font-size:12.5px; width:100%; margin:12px 0; }
+table th, table td { padding:6px 8px !important; vertical-align:top; }
+table th[align="right"], table td[align="right"] { text-align:right; font-variant-numeric:tabular-nums; }
+table th[align="left"], table td[align="left"] { text-align:left; }
+table th[align="center"], table td[align="center"] { text-align:center; }
+caption { color:#364f65; text-align:left; font-size:12px; }
+.eda-figure-block .figure { margin:8px 0 12px; }
+.eda-figure-block p.caption { color:#364f65; font-size:12px; line-height:1.35; margin-top:5px; }
+details.r-source { margin:8px 0; border:1px solid #dbe3ea; border-radius:4px; }
+details.r-source summary { cursor:pointer; padding:7px 10px; color:#34546e; font-size:12px; background:#f7f9fb; }
+details.r-source pre { margin:0; border:0; border-top:1px solid #dbe3ea; border-radius:0; max-height:520px; overflow:auto; }
+.btn-group.pull-right { display:none; }
+.scope-note { padding:9px 12px; background:#f4f6f8; border-left:3px solid #7f95a9; font-size:12px; }
+@media print {
+  @page { size:A4; margin:14mm 15mm; }
+  body { font-size:10.5pt; line-height:1.28; color:#111; }
+  .main-container { max-width:none; width:100%; padding:0; }
+  h1.title { font-size:21pt; }
+  h2 { font-size:15pt; margin-top:14px; margin-bottom:7px; break-after:avoid; }
+  h3 { font-size:12pt; margin-top:10px; margin-bottom:5px; break-after:avoid; }
+  p { margin-bottom:7px; }
+  table { font-size:9pt; margin:7px 0; break-inside:avoid; }
+  table th,table td { padding:3px 5px !important; }
+  caption { font-size:9pt; }
+  details.r-source,.btn-group,.code-folding-btn { display:none !important; }
+  img { max-width:100% !important; break-inside:avoid; }
+  .eda-figure-block .figure { break-inside:avoid; margin:5px 0 7px; }
+  .eda-figure-block p.caption { font-size:9pt; line-height:1.25; margin-top:4px; }
+  pre { white-space:pre-wrap; }
+  a[href]:after { content:none !important; }
+  .scope-note { font-size:9pt; }
+}
