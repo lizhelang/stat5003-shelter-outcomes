@@ -1,3 +1,0 @@
-"Model","C","Gamma_multiplier","Weighting","Candidate","Mean_Macro_F1","SD_Macro_F1","Mean_Balanced_Accuracy","Mean_Accuracy","Total_seconds"
-"SVM baseline",1,1,"none",5,0.349292199110468,0.00348462557081256,0.37707220007074,0.794831119192489,69.65
-"SVM selected by CV",10,4,"none",9,0.45551929276093,0.0122909872387711,0.439976810090363,0.800029231434507,63.55

@@ -1,8 +1,0 @@
-XGBoost comparison + final holdout protocol
-1) Tuning / ranking: max 250 rounds, evals=validation fold, early_stopping_rounds=20;
-   best_iteration from attr(bst, 'early_stop')$best_iteration (xgboost 3.x).
-   Ranking macro-F1 and per-class recall share one OOF pass of the selected config.
-2) Final model: refit once on full x_train/y_train with the selected hyper-parameters
-   and nrounds = round(mean OOF best_nrounds) = 184.
-   Holdout x_test/y_test is scored once and never used for early stopping or tuning.
-Decision Tree remains unscored; that does not block this four-model final evaluation.

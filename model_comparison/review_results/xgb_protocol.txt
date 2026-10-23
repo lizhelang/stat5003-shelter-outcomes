@@ -1,9 +1,0 @@
-XGBoost: fixed 150 boosting rounds for all A/B/C configurations and final refit.
-Seed 5003, nthread 2, common five stratified folds; training-only preprocessing and weights.
-A: defaults, unweighted; B: defaults, balanced weights; C: balanced weights plus 16-point grid.
-Select highest mean fold macro-F1; tie selects first grid row. No early stopping.
-Ranking, per-class metrics and confusion matrices reuse the selected grid's OOF predictions.
-The holdout does not determine parameters, rounds or model choice.
-This reproduces the latest branch analysis; prior project versions already inspected the holdout.
-R 4.5.0 ; xgboost 3.1.2.1
-Source dataset MD5: 93307e100fd67f4fc8319c465fb142f4

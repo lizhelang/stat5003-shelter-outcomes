@@ -66,7 +66,7 @@ details.r-source pre { margin:0; border:0; border-top:1px solid #dbe3ea; border-
 .scope-note { padding:9px 12px; background:#f4f6f8; border-left:3px solid #7f95a9; font-size:12px; }
 @media print {
   @page { size:A4; margin:14mm 15mm; }
-  body { font-size:10.5pt; line-height:1.28; color:#111; }
+  body { font-size:10.5pt; line-height:1.26; color:#111; }
   .main-container { max-width:none; width:100%; padding:0; }
   h1.title { font-size:21pt; }
   h2 { font-size:15pt; margin-top:14px; margin-bottom:7px; break-after:avoid; }
@@ -3267,7 +3267,7 @@ OpenAI Codex (GPT-5.6 and GPT-6, OpenAI, https://openai.com/codex/) assisted wit
 
 ## Reproducibility
 
-This Rmd contains all preprocessing, EDA, five model workflows, tuning, prediction, verification and report-generation code. Place it beside `Austin_Animal_Center_Outcomes_20260916.csv` and install the packages listed in the setup block. Knit to HTML in RStudio, or run the command below. A full render retrains all grids and may take several minutes or longer; no separate scripts, result CSVs or stylesheets are required. HTML source panels are collapsed by default, and figures and styles are embedded.
+Keep the Rmd beside the raw CSV and install the packages listed in its setup block. Knit to HTML in RStudio; all five models are refitted. Command-line instructions are included in the HTML. For PDF, open the HTML in Chrome or Edge and choose Print → Save as PDF (A4).
 
 ```{r reproduce, eval=FALSE, fold_label="Show the single-file render command"}
 rmarkdown::render("STAT5003_A2_W01G04.Rmd")

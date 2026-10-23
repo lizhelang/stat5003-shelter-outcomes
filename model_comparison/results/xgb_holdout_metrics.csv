@@ -1,2 +1,0 @@
-"Model","Evaluation","Macro_F1","Balanced_Accuracy","Accuracy","nrounds","max_depth","eta","subsample","colsample_bytree","min_child_weight","Protocol"
-"XGBoost (weighted + tuned)","Held-out test (20%)",0.471885719146745,0.516956148255006,0.686087990487515,184,6,0.1,0.8,0.85,1,"full-train refit; nrounds frozen at mean OOF best_iteration=184; same hyper-params as unified CV; holdout unused for tuning/early-stop"

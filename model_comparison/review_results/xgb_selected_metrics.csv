@@ -1,2 +1,0 @@
-"Model","nrounds","seed","max_depth","eta","subsample","colsample_bytree","min_child_weight","Mean_CV_Macro_F1","SD_CV_Macro_F1","Mean_CV_Balanced_Accuracy","Mean_CV_Accuracy","Mean_CV_Weighted_F1","Macro_F1","Balanced_Accuracy","Accuracy","Weighted_F1"
-"XGBoost",150,5003,6,0.05,0.8,0.85,3,0.491513247398385,0.0132621472189007,0.552954520782797,0.684858940277576,0.71928291943587,0.491527826878651,0.552963459353736,0.684859285661246,0.719316613467916
