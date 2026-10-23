@@ -2,19 +2,38 @@
 title: "Predicting Shelter Outcomes"
 subtitle: "STAT5003 Assignment 2"
 author: "W01G04"
+params:
+  data_file: "Austin_Animal_Center_Outcomes_20260916.csv"
 output:
   html_document:
     code_folding: hide
     self_contained: true
     theme: default
     mathjax: null
-    css: report_support/report.css
 ---
 
 ```{r setup, include=FALSE}
-knitr::opts_chunk$set(message = FALSE, warning = FALSE, fig.align = "center",
-                      out.width = "100%", fig.width = 9, fig.height = 3.8, dpi = 150)
-# Native disclosure controls keep source closed even when JavaScript is disabled.
+# This document requires only this Rmd, the raw CSV and installed R packages.
+# No external R scripts, templates, stylesheets or saved model results are read.
+required_packages <- c(
+  "rmarkdown", "knitr", "htmltools", "dplyr", "tidyr", "stringr", "forcats",
+  "ggplot2", "scales", "lubridate", "patchwork", "caret", "ranger",
+  "xgboost", "nnet", "glmnet", "e1071", "rpart"
+)
+missing_packages <- required_packages[!vapply(required_packages, requireNamespace,
+                                               logical(1), quietly = TRUE)]
+if (length(missing_packages)) {
+  stop("Install the required R packages before knitting: ",
+       paste(missing_packages, collapse = ", "))
+}
+if (!file.exists(params$data_file)) {
+  stop("Place the raw CSV beside this Rmd, or set params$data_file: ", params$data_file)
+}
+knitr::opts_chunk$set(message = FALSE, warning = FALSE, cache = FALSE,
+                      fig.align = "center", out.width = "100%",
+                      fig.width = 9, fig.height = 3.8, dpi = 150)
+# A user may set this to a larger value before rendering; one worker is portable.
+options(stat5003.svm.workers = getOption("stat5003.svm.workers", 1L))
 knitr::knit_hooks$set(source = function(x, options) {
   label <- if (is.null(options$fold_label)) "Show R code" else options$fold_label
   paste0('<details class="r-source"><summary>', htmltools::htmlEscape(label), '</summary>',
@@ -22,18 +41,2822 @@ knitr::knit_hooks$set(source = function(x, options) {
          htmltools::htmlEscape(paste(x, collapse = "\n")),
          '</code></pre></details>\n\n')
 })
-source("report_support/preprocessing.R")
-source("report_support/report_data.R")
-eda <- new.env(parent = globalenv())
-grDevices::pdf(NULL)
-invisible(capture.output(sys.source("report_support/eda_source.R", envir = eda)))
-grDevices::dev.off()
+```
+
+<style>
+body { color:#18212b; font-size:14px; line-height:1.5; }
+.main-container { max-width:1000px; }
+h1.title { font-size:29px; margin-bottom:8px; }
+h1,h2,h3 { color:#182f46; }
+h2 { font-size:23px; margin-top:28px; }
+h3 { font-size:18px; margin-top:20px; }
+h4 { font-size:16px; }
+table { font-size:12.5px; width:100%; margin:12px 0; }
+table th, table td { padding:6px 8px !important; vertical-align:top; }
+table th[align="right"], table td[align="right"] { text-align:right; font-variant-numeric:tabular-nums; }
+table th[align="left"], table td[align="left"] { text-align:left; }
+table th[align="center"], table td[align="center"] { text-align:center; }
+caption { color:#364f65; text-align:left; font-size:12px; }
+.eda-figure-block .figure { margin:8px 0 12px; }
+.eda-figure-block p.caption { color:#364f65; font-size:12px; line-height:1.35; margin-top:5px; }
+details.r-source { margin:8px 0; border:1px solid #dbe3ea; border-radius:4px; }
+details.r-source summary { cursor:pointer; padding:7px 10px; color:#34546e; font-size:12px; background:#f7f9fb; }
+details.r-source pre { margin:0; border:0; border-top:1px solid #dbe3ea; border-radius:0; max-height:520px; overflow:auto; }
+.btn-group.pull-right { display:none; }
+.scope-note { padding:9px 12px; background:#f4f6f8; border-left:3px solid #7f95a9; font-size:12px; }
+@media print {
+  @page { size:A4; margin:14mm 15mm; }
+  body { font-size:10.5pt; line-height:1.28; color:#111; }
+  .main-container { max-width:none; width:100%; padding:0; }
+  h1.title { font-size:21pt; }
+  h2 { font-size:15pt; margin-top:14px; margin-bottom:7px; break-after:avoid; }
+  h3 { font-size:12pt; margin-top:10px; margin-bottom:5px; break-after:avoid; }
+  p { margin-bottom:7px; }
+  table { font-size:9pt; margin:7px 0; break-inside:avoid; }
+  table th,table td { padding:3px 5px !important; }
+  caption { font-size:9pt; }
+  details.r-source,.btn-group,.code-folding-btn { display:none !important; }
+  img { max-width:100% !important; break-inside:avoid; }
+  .eda-figure-block .figure { break-inside:avoid; margin:5px 0 7px; }
+  .eda-figure-block p.caption { font-size:9pt; line-height:1.25; margin-top:4px; }
+  pre { white-space:pre-wrap; }
+  a[href]:after { content:none !important; }
+  .scope-note { font-size:9pt; }
+}
+
+</style>
+
+<!-- All analysis code is embedded below. Knitting refits every model; no saved result files are required. -->
+
+```{r compute-preprocessing, include=FALSE}
+shared <- local({
+suppressPackageStartupMessages({
+library(dplyr); library(tidyr); library(stringr); library(forcats);
+library(ggplot2); library(scales); library(lubridate);
+library(caret); library(ranger); library(knitr)
+})
+set.seed(5003)
+# ---- dataset-scope ----
+knitr::opts_chunk$set(
+  message = FALSE,
+  warning = FALSE
+)
+
+library(tidyr)
+library(dplyr)
+library(stringr)
+library(forcats)
+library(ggplot2)
+library(scales)
+library(patchwork)
+
+# The CSV is stored in the same folder as this R Markdown file.
+data <- read.csv(
+  params$data_file,
+  stringsAsFactors = TRUE
+)
+
+# Restrict the scope to cats and dogs and consolidate the 28 raw outcomes.
+data_selected <- data %>%
+  filter(Type %in% c("Dog", "Puppy", "Cat", "Kitten")) %>%
+  mutate(
+    Outcome.Group = case_when(
+      str_detect(Outcome.Status, regex("Adopt", ignore_case = TRUE)) ~ "Adoption",
+      str_detect(Outcome.Status, regex("Transfer", ignore_case = TRUE)) ~ "Transfer",
+      str_detect(Outcome.Status, regex("Euthan", ignore_case = TRUE)) ~ "Euthanasia",
+      str_detect(
+        Outcome.Status,
+        regex("Reclaim|Redemption|Returned To Owner|Return to Habitat", ignore_case = TRUE)
+      ) ~ "Return",
+      TRUE ~ "Other"
+    ),
+    Outcome.Group = factor(
+      Outcome.Group,
+      levels = c("Adoption", "Transfer", "Return", "Euthanasia", "Other")
+    )
+  )
+
+group_summary <- data_selected %>%
+  count(Outcome.Group, name = "Count") %>%
+  mutate(
+    Percentage = 100 * Count / sum(Count),
+    Outcome.Group = factor(Outcome.Group, levels = levels(data_selected$Outcome.Group))
+  )
+
+key_missing <- c(
+  "Name", "Euthanasia.Reason", "Secondary.Color",
+  "Date.of.Birth", "Spayed.Neutered"
+)
+
+missing_summary <- tibble(
+  Feature = key_missing,
+  Missing_Pct = sapply(
+    key_missing,
+    function(feature) {
+      values <- data_selected[[feature]]
+      100 * mean(is.na(values) | trimws(as.character(values)) == "")
+    }
+  )
+) %>%
+  arrange(Missing_Pct) %>%
+  mutate(Feature = factor(Feature, levels = Feature))
+
+
+
+# ---- eda-data-quality ----
+library(lubridate)
+
+# EDA audit helpers: inspect blanks and read date strings without changing the source.
+is_blank <- function(x) {
+  is.na(x) | trimws(as.character(x)) == ""
+}
+
+parse_shelter_date <- function(x) {
+  as.Date(parse_date_time(
+    as.character(x),
+    orders = c("Y b d I M S p", "ymd HMS", "mdy HMS", "dmy HMS",
+               "ymd", "mdy", "dmy"),
+    locale = "C", tz = "UTC", quiet = TRUE
+  ))
+}
+
+# Keep this copy unchanged throughout EDA.
+data_eda <- data_selected
+
+# age check
+age_audit <- tibble(
+  DOB = parse_shelter_date(data_eda$Date.of.Birth),
+  Intake_Date = parse_shelter_date(data_eda$Intake.Date)
+) %>%
+  mutate(Age_Years_raw = as.numeric(Intake_Date - DOB) / 365)
+
+quality_features <- c(
+  "Type", "Sex", "Spayed.Neutered", "Primary.Breed",
+  "Primary.Color", "Secondary.Color", "Name", "Date.of.Birth", "Intake.Date"
+)
+quality_summary <- tibble(
+  Feature = quality_features,
+  Distinct_nonblank = sapply(quality_features, function(v) {
+    x <- as.character(data_eda[[v]])
+    n_distinct(x[!is_blank(x)])
+  }),
+  Missing_n = sapply(quality_features, function(v) sum(is_blank(data_eda[[v]]))),
+  Missing_pct = 100 * Missing_n / nrow(data_eda),
+  Unknown_label_n = sapply(quality_features, function(v) {
+    sum(str_to_lower(trimws(as.character(data_eda[[v]]))) == "unknown",
+        na.rm = TRUE)
+  })
+)
+
+
+quality_checks <- tibble(
+  Check = c("Records", "Distinct nonmissing Animal IDs", "Exact duplicate rows",
+            "Animal IDs with more than one record", "Missing Animal IDs",
+            "Nonblank birth dates that failed parsing",
+            "Nonblank intake dates that failed parsing",
+            "Age unavailable from dates", "Negative ages observed"),
+  Count = c(
+    nrow(data_eda),
+    n_distinct(data_eda$Animal.ID[!is_blank(data_eda$Animal.ID)]),
+    sum(duplicated(data_eda)),
+    sum(table(data_eda$Animal.ID[!is_blank(data_eda$Animal.ID)]) > 1),
+    sum(is_blank(data_eda$Animal.ID)),
+    sum(!is_blank(data_eda$Date.of.Birth) & is.na(age_audit$DOB)),
+    sum(!is_blank(data_eda$Intake.Date) & is.na(age_audit$Intake_Date)),
+    sum(is.na(age_audit$Age_Years_raw)),
+    sum(age_audit$Age_Years_raw < 0, na.rm = TRUE)
+  )
+)
+
+
+
+# ---- latest-intake-record ----
+# Preprocessing 1. Retain one record per animal: its latest recorded intake.
+# Keep the source row order so tied intake timestamps have a fixed rule.
+data_latest <- data_selected %>%
+  mutate(
+    .source_row = row_number(),
+    Intake_Datetime = parse_date_time(
+      as.character(Intake.Date),
+      orders = c("Y b d I M S p", "ymd HMS", "mdy HMS", "dmy HMS",
+                 "ymd", "mdy", "dmy"),
+      locale = "C", tz = "UTC", quiet = TRUE
+    )
+  )
+
+data_latest <- data_latest %>%
+  # Sort each animal's records from newest to oldest.
+  # For equal timestamps, the first row in the source file comes first.
+  arrange(Animal.ID, desc(Intake_Datetime), .source_row) %>%
+  group_by(Animal.ID) %>%
+  filter(row_number() == 1) %>%
+  ungroup() %>%
+  # Restore source order and remove the temporary selection columns.
+  arrange(.source_row) %>%
+  select(-.source_row, -Intake_Datetime)
+
+
+# ---- fixed-model-features ----
+# Preprocessing 2-6. Construct model features from the retained latest-intake records.
+prepare_features <- function(df) {
+  df %>%
+    mutate(
+      # 2. Type-Age redundancy: Type now contains species only.
+      Type_original = as.character(Type),
+      Type = factor(case_when(
+        Type_original %in% c("Dog", "Puppy") ~ "Dog",
+        Type_original %in% c("Cat", "Kitten") ~ "Cat",
+        TRUE ~ NA_character_
+      ), levels = c("Cat", "Dog")),
+
+      # 3. Age at intake: this is the first conversion of negative ages to NA.
+      DOB = parse_shelter_date(Date.of.Birth),
+      Intake_Date = parse_shelter_date(Intake.Date),
+      Age_Years_raw = as.numeric(Intake_Date - DOB) / 365,
+      Age_Years = if_else(Age_Years_raw < 0, NA_real_, Age_Years_raw),
+
+      # 4. Name: treat blanks and case-insensitive placeholders as not recorded.
+      has_Name = factor(if_else(
+        is_blank(Name) | str_to_lower(trimws(as.character(Name))) %in%
+          c("unknown", "*", "n/a", "na"), "0", "1"
+      ), levels = c("0", "1")),
+
+      # 5. Sex / Spayed.Neutered: standardise spelling, case and missing values.
+      Sex = factor(case_when(
+        str_to_lower(trimws(as.character(Sex))) == "male" ~ "Male",
+        str_to_lower(trimws(as.character(Sex))) == "female" ~ "Female",
+        TRUE ~ "Unknown"
+      ), levels = c("Female", "Male", "Unknown")),
+      Spayed.Neutered = factor(case_when(
+        str_to_lower(trimws(as.character(Spayed.Neutered))) == "yes" ~ "Yes",
+        str_to_lower(trimws(as.character(Spayed.Neutered))) == "no" ~ "No",
+        TRUE ~ "Unknown"
+      ), levels = c("No", "Yes", "Unknown")),
+
+      # 6. Breed / Colour: fixed text cleaning; frequency grouping is deferred.
+      Primary.Breed = if_else(is_blank(Primary.Breed), "Unknown",
+                              trimws(as.character(Primary.Breed))),
+      Base_Color = factor(case_when(
+        is_blank(Primary.Color) ~ "Unknown",
+        str_detect(Primary.Color, regex("brown|tan|choc|fawn|buff|sable|liver|cinnamon|rust|agouti|bronze|chestnut|sandy|seal", ignore_case = TRUE)) ~ "Brown/Tan",
+        str_detect(Primary.Color, regex("black|charcoal|sooty", ignore_case = TRUE)) ~ "Black",
+        str_detect(Primary.Color, regex("white|cream|blonde|albino|champagne|wheat|snow", ignore_case = TRUE)) ~ "White/Cream",
+        str_detect(Primary.Color, regex("blue|grey|gray|silver|lilac|wolf", ignore_case = TRUE)) ~ "Blue/Grey",
+        str_detect(Primary.Color, regex("orange|red|ginger|yellow|gold|apricot|lemon|flame", ignore_case = TRUE)) ~ "Orange/Red",
+        TRUE ~ "Other"
+      )),
+      has_pattern = factor(case_when(
+        !is_blank(Secondary.Color) |
+          coalesce(str_detect(Primary.Color, regex(
+            "tabby|brindle|smoke|point|calico|torbie|tort|tri|merle|tiger|ticked|lynx|roan|bicolor|patch|shaded",
+            ignore_case = TRUE
+          )), FALSE) ~ "Mixed",
+        is_blank(Primary.Color) ~ "Unknown",
+        TRUE ~ "Pure"
+      ), levels = c("Pure", "Mixed", "Unknown"))
+    )
+}
+
+data_features <- prepare_features(data_latest)
+
+# ---- shared-data-split ----
+# Preprocessing 7. Shared 80/20 split and 5 CV folds using caret.
+library(caret)
+set.seed(5003)
+
+# createDataPartition returns the training row numbers, stratified by outcome.
+train_index <- createDataPartition(
+  data_features$Outcome.Group,
+  p = 0.8,
+  list = FALSE
+)
+train_raw <- data_features[train_index, ]
+test_raw <- data_features[-train_index, ]
+y_train <- train_raw$Outcome.Group
+y_test <- test_raw$Outcome.Group
+
+# Each list element contains the validation row numbers within train_raw.
+cv_folds <- createFolds(
+  y_train,
+  k = 5,
+  list = TRUE,
+  returnTrain = FALSE
+)
+
+# ---- common-train-test-preprocessing ----
+# 8. Learn species-specific age medians from training only.
+overall_age_median <- median(train_raw$Age_Years, na.rm = TRUE)
+age_medians <- train_raw %>%
+  group_by(Type) %>%
+  summarise(Age_Median = median(Age_Years, na.rm = TRUE), .groups = "drop")
+
+# 9. Select the eight most common recorded breeds in training.
+top8_breeds <- train_raw %>%
+  filter(Primary.Breed != "Unknown") %>%
+  count(Primary.Breed, name = "Count") %>%
+  arrange(desc(Count), Primary.Breed) %>%
+  filter(row_number() <= 8) %>%
+  pull(Primary.Breed)
+
+# 10. Keep these eight predictors in x_train/x_test; y_train/y_test hold the outcome.
+model_predictors <- c(
+  "Type", "Sex", "Spayed.Neutered", "primary.breed.group",
+  "Base_Color", "has_pattern", "has_Name", "Age_Years_imputed"
+)
+factor_predictors <- setdiff(model_predictors, "Age_Years_imputed")
+
+# Apply steps 8-10 to training: fill missing ages and group breeds.
+# Use the overall training median only if a species median is unavailable.
+x_train <- train_raw %>%
+  left_join(age_medians, by = "Type") %>%
+  mutate(
+    Age_Years_imputed = case_when(
+      !is.na(Age_Years) ~ Age_Years,
+      !is.na(Age_Median) ~ Age_Median,
+      TRUE ~ overall_age_median
+    ),
+    primary.breed.group = if_else(
+      Primary.Breed %in% top8_breeds, Primary.Breed, "Other"
+    )
+  ) %>%
+  select(all_of(model_predictors))
+
+# Apply the same training medians and breed list to the test data.
+x_test <- test_raw %>%
+  left_join(age_medians, by = "Type") %>%
+  mutate(
+    Age_Years_imputed = case_when(
+      !is.na(Age_Years) ~ Age_Years,
+      !is.na(Age_Median) ~ Age_Median,
+      TRUE ~ overall_age_median
+    ),
+    primary.breed.group = if_else(
+      Primary.Breed %in% top8_breeds, Primary.Breed, "Other"
+    )
+  ) %>%
+  select(all_of(model_predictors))
+
+# Use the same factor levels in training and test data.
+for (variable in factor_predictors) {
+  x_train[[variable]] <- factor(x_train[[variable]])
+  x_test[[variable]] <- factor(
+    x_test[[variable]],
+    levels = levels(x_train[[variable]])
+  )
+}
+
+
+# ---- common-cv-preprocessing ----
+# Repeat steps 8-10 within each fold, starting from data before imputation.
+# Learn the rules from fold_train only, then apply them to fold_valid.
+cv_data <- list()
+for (k in 1:5) {
+  fold_train <- train_raw[-cv_folds[[k]], ]
+  fold_valid <- train_raw[cv_folds[[k]], ]
+
+  # 8. Age medians from this fold's training data.
+  fold_overall_median <- median(fold_train$Age_Years, na.rm = TRUE)
+  fold_age_medians <- fold_train %>%
+    group_by(Type) %>%
+    summarise(Age_Median = median(Age_Years, na.rm = TRUE), .groups = "drop")
+
+  # 9. Top eight breeds from this fold's training data.
+  fold_top8_breeds <- fold_train %>%
+    filter(Primary.Breed != "Unknown") %>%
+    count(Primary.Breed, name = "Count") %>%
+    arrange(desc(Count), Primary.Breed) %>%
+    filter(row_number() <= 8) %>%
+    pull(Primary.Breed)
+
+  # 8-10. Apply the rules and keep the common predictors.
+  fold_train <- fold_train %>%
+    left_join(fold_age_medians, by = "Type") %>%
+    mutate(
+      Age_Years_imputed = case_when(
+        !is.na(Age_Years) ~ Age_Years,
+        !is.na(Age_Median) ~ Age_Median,
+        TRUE ~ fold_overall_median
+      ),
+      primary.breed.group = if_else(
+        Primary.Breed %in% fold_top8_breeds, Primary.Breed, "Other"
+      )
+    ) %>%
+    select(Outcome.Group, all_of(model_predictors))
+
+  fold_valid <- fold_valid %>%
+    left_join(fold_age_medians, by = "Type") %>%
+    mutate(
+      Age_Years_imputed = case_when(
+        !is.na(Age_Years) ~ Age_Years,
+        !is.na(Age_Median) ~ Age_Median,
+        TRUE ~ fold_overall_median
+      ),
+      primary.breed.group = if_else(
+        Primary.Breed %in% fold_top8_breeds, Primary.Breed, "Other"
+      )
+    ) %>%
+    select(Outcome.Group, all_of(model_predictors))
+
+  # 10. Use this fold's training factor levels for validation.
+  for (variable in factor_predictors) {
+    fold_train[[variable]] <- factor(fold_train[[variable]])
+    fold_valid[[variable]] <- factor(
+      fold_valid[[variable]],
+      levels = levels(fold_train[[variable]])
+    )
+  }
+
+  cv_data[[k]] <- list(
+    x_train = select(fold_train, all_of(model_predictors)),
+    y_train = fold_train$Outcome.Group,
+    x_valid = select(fold_valid, all_of(model_predictors)),
+    y_valid = fold_valid$Outcome.Group
+  )
+}
+
+# Each cv_data[[k]] contains x_train, y_train, x_valid and y_valid.
+# Validation data stay separate from the final x_test/y_test holdout.
+# cv_folds[[k]] identifies the validation rows for out-of-fold predictions.
+# This block prepares common data; model fitting/scoring belongs in each model section.
+
+# Variable	Description
+# x_train	Preprocessed predictors for the full training set (80%).
+# y_train	Outcome labels for the full training set.
+# x_test	Test predictors processed using the training-derived rules (20%).
+# y_test	Outcome labels for final test evaluation.
+# 5-fold CV : cv_data
+  rng_state <- .Random.seed
+  environment()
+})
+# Expose shared summaries to the narrative and plots.
+list2env(as.list(shared, all.names = TRUE), envir = environment())
+```
+
+```{r compute-eda, include=FALSE}
+eda <- local({
+# Original EDA source retained from STAT5003_group_project_RMarkdown_template_v29.Rmd.
+# Complete calculations are included here in an isolated scope for report layout.
+
+# Original EDA chunk 1: eda-data-quality, message=FALSE, warning=FALSE
+library(lubridate)
+
+# EDA audit helpers: inspect blanks and read date strings without changing the source.
+is_blank <- function(x) {
+  is.na(x) | trimws(as.character(x)) == ""
+}
+
+parse_shelter_date <- function(x) {
+  as.Date(parse_date_time(
+    as.character(x),
+    orders = c("Y b d I M S p", "ymd HMS", "mdy HMS", "dmy HMS",
+               "ymd", "mdy", "dmy"),
+    locale = "C", tz = "UTC", quiet = TRUE
+  ))
+}
+
+# Keep this copy unchanged throughout EDA.
+data_eda <- data_selected
+
+# age check
+age_audit <- tibble(
+  DOB = parse_shelter_date(data_eda$Date.of.Birth),
+  Intake_Date = parse_shelter_date(data_eda$Intake.Date)
+) %>%
+  mutate(Age_Years_raw = as.numeric(Intake_Date - DOB) / 365)
+
+quality_features <- c(
+  "Type", "Sex", "Spayed.Neutered", "Primary.Breed",
+  "Primary.Color", "Secondary.Color", "Name", "Date.of.Birth", "Intake.Date"
+)
+quality_summary <- tibble(
+  Feature = quality_features,
+  Distinct_nonblank = sapply(quality_features, function(v) {
+    x <- as.character(data_eda[[v]])
+    n_distinct(x[!is_blank(x)])
+  }),
+  Missing_n = sapply(quality_features, function(v) sum(is_blank(data_eda[[v]]))),
+  Missing_pct = 100 * Missing_n / nrow(data_eda),
+  Unknown_label_n = sapply(quality_features, function(v) {
+    sum(str_to_lower(trimws(as.character(data_eda[[v]]))) == "unknown",
+        na.rm = TRUE)
+  })
+)
+knitr::kable(quality_summary, digits = 2,
+             caption = "Raw-field quality in the complete cat-and-dog subset")
+
+quality_checks <- tibble(
+  Check = c("Records", "Distinct nonmissing Animal IDs", "Exact duplicate rows",
+            "Animal IDs with more than one record", "Missing Animal IDs",
+            "Nonblank birth dates that failed parsing",
+            "Nonblank intake dates that failed parsing",
+            "Age unavailable from dates", "Negative ages observed"),
+  Count = c(
+    nrow(data_eda),
+    n_distinct(data_eda$Animal.ID[!is_blank(data_eda$Animal.ID)]),
+    sum(duplicated(data_eda)),
+    sum(table(data_eda$Animal.ID[!is_blank(data_eda$Animal.ID)]) > 1),
+    sum(is_blank(data_eda$Animal.ID)),
+    sum(!is_blank(data_eda$Date.of.Birth) & is.na(age_audit$DOB)),
+    sum(!is_blank(data_eda$Intake.Date) & is.na(age_audit$Intake_Date)),
+    sum(is.na(age_audit$Age_Years_raw)),
+    sum(age_audit$Age_Years_raw < 0, na.rm = TRUE)
+  )
+)
+knitr::kable(quality_checks, caption = "Record and date checks")
+
+# Original EDA chunk 2: eda-plot-helpers
+# These functions aggregate observed categories
+outcome_colours <- setNames(
+  c("#66C2A5", "#FC8D62", "#8DA0CB", "#E78AC3", "#A6D854"),
+  levels(data_eda$Outcome.Group)
+)
+
+outcome_summary <- function(df, feature) {
+  df %>%
+    mutate(Level = as.character(.data[[feature]])) %>%
+    select(Level, Outcome.Group) %>%
+    count(Level, Outcome.Group, .drop = FALSE) %>%
+    group_by(Level) %>%
+    mutate(Total = sum(n), Prop = n / Total) %>%
+    ungroup()
+}
+
+# Axis labels distinguish NA, blanks and whitespace without changing their values.
+display_eda_level <- function(x) {
+  labels <- as.character(x)
+  labels[is.na(x)] <- "<NA>"
+  labels[!is.na(x) & x == ""] <- "<blank>"
+  whitespace <- !is.na(x) & x != "" & trimws(x) == ""
+  labels[whitespace] <- "<whitespace>"
+  labels
+}
+
+plot_outcome_summary <- function(summary, title) {
+  totals <- distinct(summary, Level, Total)
+  ggplot(summary, aes(x = Level, y = Prop, fill = Outcome.Group)) +
+    geom_col(width = 0.6) +
+    scale_x_discrete(labels = function(x) {
+      paste0(display_eda_level(x), "\n(n=",
+             scales::comma(totals$Total[match(x, totals$Level)]), ")")
+    }) +
+    scale_y_continuous(labels = percent_format(),
+                       expand = expansion(mult = c(0, 0.03))) +
+    scale_fill_manual(values = outcome_colours, drop = FALSE) +
+    labs(title = title, x = NULL, y = "Within-group proportion", fill = "Outcome") +
+    theme_minimal(base_size = 9) +
+    theme(plot.title = element_text(face = "bold", size = 10),
+          axis.text.x = element_text(angle = 30, hjust = 1),
+          panel.grid.minor = element_blank(), legend.position = "bottom")
+}
+
+plot_outcome <- function(df, feature, title) {
+  plot_outcome_summary(outcome_summary(df, feature), title)
+}
+
+plot_outcome_heatmap <- function(summary, title) {
+  totals <- distinct(summary, Level, Total)
+  ggplot(summary, aes(x = Outcome.Group, y = Level, fill = Prop)) +
+    geom_tile(colour = "white") +
+    geom_text(aes(label = if_else(Prop >= 0.08, sprintf("%.0f%%", 100 * Prop), "")),
+              size = 3) +
+    scale_y_discrete(labels = function(x) {
+      paste0(display_eda_level(x), " (n=",
+             scales::comma(totals$Total[match(x, totals$Level)]), ")")
+    }) +
+    scale_fill_gradient(low = "#F0F4F8", high = "#1F78B4", labels = percent_format()) +
+    labs(title = title, x = NULL, y = NULL, fill = "Proportion") +
+    theme_minimal(base_size = 9) +
+    theme(plot.title = element_text(face = "bold", size = 10),
+          panel.grid = element_blank())
+}
+
+outcome_rate <- function(feature, level, outcome) {
+  x <- outcome_summary(data_eda, feature)
+  index <- !is.na(x$Level) & x$Level == level & x$Outcome.Group == outcome
+  value <- x$Prop[index]
+  if (length(value) == 0L) return("not observed")
+  sprintf("%.1f%%", 100 * value)
+}
+
+# Original EDA chunk 3: type-outcome, fig.width=9, fig.height=3.5, out.width="85%", fig.align="center"
+# Summarise original Type values
+type_age_summary <- tibble(
+  Type = data_eda$Type,
+  Age_Years_raw = age_audit$Age_Years_raw
+) %>%
+  group_by(Type, .drop = TRUE) %>%
+  summarise(
+    n = n(),
+    Missing_age = sum(is.na(Age_Years_raw)),
+    Negative_age = sum(Age_Years_raw < 0, na.rm = TRUE),
+    Median_age = median(Age_Years_raw[!is.na(Age_Years_raw) & Age_Years_raw >= 0]),
+    Q1 = quantile(Age_Years_raw[!is.na(Age_Years_raw) & Age_Years_raw >= 0], 0.25),
+    Q3 = quantile(Age_Years_raw[!is.na(Age_Years_raw) & Age_Years_raw >= 0], 0.75),
+    .groups = "drop"
+  )
+knitr::kable(type_age_summary, digits = 2,
+             caption = "Original Type categories and observed nonnegative age")
+p_type_outcome <- plot_outcome(data_eda, "Type", "Shelter Outcome by Original Type")
+print(p_type_outcome)
+
+# Original EDA chunk 4: , fig.width=9, fig.height=3.5, out.width="85%", fig.align='center'
+library(ggplot2)
+breed_summary <- data_selected %>%
+  count(Primary.Breed, name = "Count") %>%
+  arrange(desc(Count)) %>%
+  mutate(
+    Rank = row_number(),
+    Pct = Count / sum(Count) * 100,
+    Cum_Pct = cumsum(Pct)
+  )
+
+elbow_breed_rank <- 8
+elbow_breed_val <- breed_summary$Cum_Pct[elbow_breed_rank]
+
+# line plot for accumulated breed distribution
+p_breed_elbow <- ggplot(breed_summary, aes(x = Rank, y = Cum_Pct)) +
+  geom_area(fill = "#1f78b4", alpha = 0.12) +
+  geom_line(color = "#1f78b4", linewidth = 1.2) +
+  geom_hline(yintercept = 80, linetype = "dashed", color = "#666666", linewidth = 0.6) +
+  geom_vline(xintercept = elbow_breed_rank, linetype = "dashed", color = "#666666", linewidth = 0.6) +
+  geom_point(data = filter(breed_summary, Rank == elbow_breed_rank),
+             color = "#e31a1c", size = 3.5) +
+  geom_point(data = filter(breed_summary, Rank == elbow_breed_rank),
+             color = "white", size = 1.5) +
+  scale_x_continuous(
+    breaks = c(1, 8, 25, 50, 100, 150, 193),
+    expand = expansion(mult = c(0.01, 0.03))
+  ) +
+  scale_y_continuous(
+    limits = c(0, 103),
+    breaks = seq(0, 100, by = 20),
+    labels = function(x) paste0(x, "%"),
+    expand = expansion(mult = c(0, 0.01))
+  ) +
+  labs(
+    title = "Primary Breed Cumulative Coverage",
+    x = "Breed Rank (Ordered by Population Frequency)",
+    y = "Cumulative Share of Population"
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(
+    plot.title = element_text(face = "bold", size = 13, color = "#1a1a1a"),
+    plot.subtitle = element_text(color = "#555555", margin = margin(b = 10)),
+    panel.grid.minor = element_blank(),
+    panel.grid.major = element_line(color = "#ebebeb"),
+    axis.line = element_line(color = "#cccccc"),
+    axis.title = element_text(face = "bold", size = 10.5)
+  )
+
+print(p_breed_elbow)
+
+# Original EDA chunk 5: , fig.width=9, fig.height=3.5, out.width="85%", fig.align='center'
+# library(tidyverse)
+#
+# #
+# raw_colors <- colour_eda$Primary.Color[!is.na(colour_eda$Primary.Color) & trimws(colour_eda$Primary.Color) != ""]
+#
+#
+# tokens <- unlist(strsplit(tolower(raw_colors), "[^a-zA-Z]+"))
+# tokens <- tokens[tokens != ""]
+#
+# word_freq <- as.data.frame(table(word = tokens), stringsAsFactors = FALSE) %>%
+#   rename(n = Freq) %>%
+#   arrange(desc(n)) %>%
+#   mutate(pct = round(n / sum(n) * 100, 2))
+# write.csv(word_freq, 'word_freq.csv')
+# Group base_color type and Check if pattern
+# Use a plotting copy; keep the original selected records unchanged.
+colour_eda <- data_eda %>%
+  mutate(
+    Base_Color = case_when(
+      str_detect(str_to_lower(Primary.Color), regex("brown|tan|choc|fawn|buff|sable|liver|cinnamon|rust|agouti|bronze|chestnut|sandy|seal", ignore_case = TRUE)) ~ "Brown/Tan",
+      str_detect(str_to_lower(Primary.Color), regex("black|charcoal|sooty", ignore_case = TRUE)) ~ "Black",
+      str_detect(str_to_lower(Primary.Color), regex("white|cream|blonde|albino|champagne|wheat|snow", ignore_case = TRUE)) ~ "White/Cream",
+      str_detect(str_to_lower(Primary.Color), regex("blue|grey|gray|silver|lilac|wolf", ignore_case = TRUE)) ~ "Blue/Grey",
+      str_detect(str_to_lower(Primary.Color), regex("orange|red|ginger|yellow|gold|apricot|lemon|flame", ignore_case = TRUE)) ~ "Orange/Red",
+      TRUE ~ "Other"
+    ),
+    Base_Color = as.factor(Base_Color),
+    has_pattern = if_else(
+      (!is.na(Secondary.Color) & Secondary.Color != '') |
+      str_detect(str_to_lower(Primary.Color), regex("tabby|brindle|smoke|Point|calico|torbie|tort|tri|merle|tiger|ticked|lynx|roan|bicolor|patch|shaded", ignore_case = TRUE)),
+      "Mixed",
+      "Pure"
+    ),
+    has_pattern = as.factor(has_pattern)
+  )
+
+
+# Base_Color distribution
+p_base_bar <- ggplot(colour_eda, aes(x = Base_Color, fill = Base_Color)) +
+  geom_bar(width = 0.6, show.legend = FALSE) +
+  geom_text(
+    stat = "count",
+    aes(label = sprintf("%.1f%%\n(%s)",
+                        after_stat(count) / sum(after_stat(count)) * 100,
+                        format(after_stat(count), big.mark = ","))),
+    vjust = -0.05,
+    size = 3.2
+  ) +
+  scale_y_continuous(expand = expansion(mult = c(0, 0.30))) +
+  scale_fill_brewer(palette = "Set2") +
+  labs(
+    title = "Distribution of Base Colors",
+    x = "Base Color Group",
+    y = "Count"
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(
+    plot.title = element_text(face = "bold", size = 8),
+    axis.text.x = element_text(angle = 35, hjust = 1, size = 7),
+    panel.grid.minor = element_blank()
+  )
+
+
+
+# has_pattern distribution
+p_pattern_bar <- ggplot(colour_eda, aes(x = has_pattern, fill = has_pattern)) +
+  geom_bar(width = 0.5, show.legend = FALSE) +
+  geom_text(
+    stat = "count",
+    aes(label = sprintf("%.1f%%\n(%s)",
+                        after_stat(count) / sum(after_stat(count)) * 100,
+                        format(after_stat(count), big.mark = ","))),
+    vjust = -0.05,
+    size = 3.2
+  ) +
+  scale_y_continuous(expand = expansion(mult = c(0, 0.30))) +
+  scale_fill_manual(values = c("Pure" = "#4575b4", "Mixed" = "#fdae61")) +
+  labs(
+    title = "Distribution of Patterns",
+    x = "Pattern",
+    y = "Count"
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(
+    plot.title = element_text(face = "bold", size = 8),
+    panel.grid.minor = element_blank()
+  )
+
+base_outcome_pct <- colour_eda %>%
+  count(Base_Color, Outcome.Group) %>%
+  group_by(Base_Color) %>%
+  mutate(
+    Prop = n / sum(n),
+    label_text = if_else(
+      Outcome.Group %in% c("Adoption", "Transfer"),
+      sprintf("%.1f%%", Prop * 100),
+      ""
+    )
+  ) %>%
+  ungroup()
+
+p_base_vs_outcome <- ggplot(base_outcome_pct, aes(x = Base_Color, y = Prop, fill = Outcome.Group)) +
+  geom_col(position = "fill", width = 0.6) +
+  geom_text(
+    aes(label = label_text),
+    position = position_fill(vjust = 0.5),
+    color = "white",
+    fontface = "bold",
+    size = 3.2
+  ) +
+  scale_y_continuous(labels = percent_format(), expand = expansion(mult = c(0, 0.05))) +
+  scale_fill_brewer(palette = "Set2") +
+  labs(
+    title = "Base Color Groups Across Outcome",
+    x = "Base Color Group",
+    y = "Proportion (%)",
+    fill = "Outcome Group"
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(
+    plot.title = element_text(face = "bold", size = 8),
+    axis.text.x = element_text(angle = 35, hjust = 1, size = 7),
+    legend.position = "right",
+    legend.title = element_text(size = 8),
+    legend.text = element_text(size = 7),
+    legend.key.height = grid::unit(0.35, "cm")
+  )
+
+
+p_base_bar + p_pattern_bar + p_base_vs_outcome+ plot_layout(widths = c(1.5, 1, 1))
+
+# Original EDA chunk 6: pattern-outcome-additional, fig.width=9, fig.height=3.5, out.width="85%", fig.align="center"
+p_pattern_outcome <- plot_outcome(
+  colour_eda, "has_pattern", "Shelter Outcome by Pattern"
+)
+print(p_pattern_outcome)
+
+# Original EDA chunk 7: , fig.width=9, fig.height=3.5, out.width="85%", fig.align='center'
+library(lubridate)
+
+# Calculate observed ages in a plotting copy only.
+age_eda <- data_eda %>%
+  # Use calendar dates, consistent with the audit and model features.
+  mutate(
+    DOB = parse_shelter_date(Date.of.Birth),
+    Intake_Date = parse_shelter_date(Intake.Date),
+    Age_Years = as.numeric(Intake_Date - DOB) / 365
+  )
+
+# Display observed nonnegative ages; do not replace or impute values in EDA.
+# Missing and negative ages remain documented in the earlier data-quality audit.
+age_eda <- age_eda %>%
+  filter(!is.na(Age_Years), Age_Years >= 0)
+
+# plot for age vs type, to check how to deal with missing value
+p_age_by_type <- ggplot(age_eda, aes(x = Type, y = Age_Years, fill = Type)) +
+  geom_boxplot(
+    width = 0.5,
+    alpha = 0.8,
+    outlier.size = 1.2,
+    outlier.alpha = 0.3,
+    outlier.color = "grey40",
+    show.legend = FALSE
+  ) +
+  scale_y_continuous(breaks = seq(0, 25, by = 2)) +
+  scale_fill_brewer(palette = "Set2") +
+  labs(
+    title = "Age Distribution Across Animal Types",
+    x = "Animal Type",
+    y = "Age (Years)"
+  ) +
+  theme_minimal(base_size = 8) +
+  theme(
+    plot.title = element_text(face = "bold"),
+    panel.grid.minor = element_blank()
+  )
+
+p_age_dist <- ggplot(filter(age_eda, !is.na(Age_Years), Age_Years >= 0), aes(x = Age_Years)) +
+  geom_histogram(binwidth = 1, fill = "#1f78b4", color = "white", boundary = 0) +
+  scale_x_continuous(breaks = seq(0, 25, by = 2)) +
+  labs(
+    title = "Distribution of Age at Intake",
+    x = "Age (Years)",
+    y = "Count"
+  ) +
+  theme_minimal(base_size = 8) +
+  theme(plot.title = element_text(face = "bold"), panel.grid.minor = element_blank())
+
+
+
+p_age_outcome <- ggplot(filter(age_eda, !is.na(Age_Years), Age_Years >= 0),
+                        aes(x = Outcome.Group, y = Age_Years, fill = Outcome.Group)) +
+  geom_boxplot(outlier.colour = "red", outlier.shape = 1, outlier.alpha = 0.4, width = 0.55, show.legend = FALSE) +
+  scale_y_continuous(breaks = seq(0, 25, by = 2)) +
+  scale_fill_brewer(palette = "Set2") +
+  labs(
+    title = "Age by Outcome",
+    x = "Outcome Group",
+    y = "Age (Years)"
+  ) +
+  theme_minimal(base_size = 8) +
+  theme(
+    plot.title = element_text(face = "bold"),
+    panel.grid.minor = element_blank()
+  )
+
+p_age_dist + p_age_by_type + p_age_outcome + plot_layout(widths = c(0.8, 0.8, 1))
+
+# Original EDA chunk 8: , fig.width=9, fig.height=3.5, out.width="85%", fig.align='center'
+p_sex_dist <- ggplot(data_selected, aes(x = Sex, fill = Sex)) +
+  geom_bar(width = 0.5, show.legend = FALSE) +
+  geom_text(
+    stat = "count",
+    aes(label = sprintf("%.1f%%\n(%s)",
+                        after_stat(count) / sum(after_stat(count)) * 100,
+                        format(after_stat(count), big.mark = ","))),
+    vjust = -0.05, size = 3.2
+  ) +
+  scale_y_continuous(expand = expansion(mult = c(0, 0.30))) +
+  scale_fill_brewer(palette = "Set2") +
+  labs(
+    title = "Distribution of Sex",
+    x = "Sex",
+    y = "Count") +
+  theme_minimal(base_size = 12) +
+  theme(
+    plot.title = element_text(face = "bold", margin = margin(b = 8)),
+    panel.grid.minor = element_blank()
+  )
+
+p_neuter_dist <- ggplot(data_selected, aes(x = Spayed.Neutered, fill = Spayed.Neutered)) +
+  geom_bar(width = 0.5, show.legend = FALSE) +
+  geom_text(
+    stat = "count",
+    aes(label = sprintf("%.1f%%\n(%s)",
+                        after_stat(count) / sum(after_stat(count)) * 100,
+                        format(after_stat(count), big.mark = ","))),
+    vjust = -0.05, size = 3.2
+  ) +
+  scale_y_continuous(expand = expansion(mult = c(0, 0.30))) +
+  scale_fill_brewer(palette = "Pastel1") +
+  labs(title = "Distribution of Spayed/Neutered Status",
+       x = "Spayed.Neutered",
+       y = "Count") +
+  theme_minimal(base_size = 12) +
+  theme(
+    plot.title = element_text(face = "bold", margin = margin(b = 8)),
+    panel.grid.minor = element_blank()
+  )
+
+p_sex_dist + p_neuter_dist + plot_layout(widths = c(1, 1))
+
+p_sex_outcome <- ggplot(
+  data_selected %>% filter(!is.na(Sex), !is.na(Outcome.Group)),
+  aes(x = Sex, fill = Outcome.Group)
+) +
+  geom_bar(position = "fill", width = 0.6) +
+  scale_y_continuous(
+    labels = scales::percent_format(),
+    expand = expansion(mult = c(0, 0.02))
+  ) +
+  scale_fill_brewer(palette = "Set2") +
+  labs(
+    title = "Shelter Outcome by Sex",
+    x = "Sex",
+    y = "Proportion",
+    fill = "Outcome"
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(
+    plot.title = element_text(face = "bold", margin = margin(b = 8)),
+    panel.grid.minor = element_blank(),
+    legend.position = "bottom"
+  )
+
+
+p_neuter_outcome <- ggplot(
+  data_selected %>% filter(!is.na(Spayed.Neutered), !is.na(Outcome.Group)),
+  aes(x = Spayed.Neutered, fill = Outcome.Group)
+) +
+  geom_bar(position = "fill", width = 0.6) +
+  scale_y_continuous(
+    labels = scales::percent_format(),
+    expand = expansion(mult = c(0, 0.02))
+  ) +
+  scale_fill_brewer(palette = "Set2") +
+  labs(
+    title = "Shelter Outcome by Spayed/Neutered Status",
+    x = "Spayed/Neutered",
+    y = "Proportion",
+    fill = "Outcome"
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(
+    plot.title = element_text(face = "bold", margin = margin(b = 8)),
+    panel.grid.minor = element_blank(),
+    legend.position = "bottom"
+  )
+
+
+p_sex_outcome + p_neuter_outcome +
+  plot_layout(widths = c(1, 1), guides = "collect") &
+  theme(legend.position = "bottom")
+
+# Original EDA chunk 9: name-outcome, fig.width=9, fig.height=3.5, out.width="85%", fig.align="center"
+# Whitespace/case checks identify placeholders for the audit
+name_outcome_pct <- data_eda %>%
+  group_by(Outcome.Group, .drop = FALSE) %>%
+  summarise(
+    Recorded = sum(
+      !is_blank(Name) &
+        !(str_to_lower(trimws(as.character(Name))) %in%
+            c("unknown", "*", "n/a", "na"))
+    ),
+    Placeholder = sum(
+      !is_blank(Name) &
+        str_to_lower(trimws(as.character(Name))) %in%
+          c("unknown", "*", "n/a", "na")
+    ),
+    Blank = sum(
+      !is.na(Name) & trimws(as.character(Name)) == "",
+      na.rm = TRUE
+    ),
+    Missing = sum(is.na(Name)),
+    .groups = "drop"
+  ) %>%
+  pivot_longer(-Outcome.Group, names_to = "Level", values_to = "n") %>%
+  group_by(Level) %>%
+  mutate(
+    Total = sum(n),
+    Prop = if_else(Total > 0, n / Total, 0)
+  ) %>%
+  ungroup() %>%
+  filter(Total > 0)
+
+p_name_outcome <- plot_outcome_summary(
+  name_outcome_pct, "Shelter Outcome by Observed Name Recording"
+)
+print(p_name_outcome)
+  environment()
+})
+```
+
+```{r compute-logistic, include=FALSE}
+# Complete multinomial logistic-regression workflow, evaluated in an isolated scope.
+# All inputs come from the shared preprocessing already executed in this Rmd.
+# Model results stay in memory; no external R scripts or saved result files are used.
+lr_results <- local({
+  suppressPackageStartupMessages({
+    library(dplyr)
+    library(tidyr)
+    library(ggplot2)
+    library(nnet)
+    library(glmnet)
+    library(splines)
+  })
+  x_train <- shared$x_train
+  x_test <- shared$x_test
+  y_train <- shared$y_train
+  y_test <- shared$y_test
+  train_raw <- shared$train_raw
+  test_raw <- shared$test_raw
+  cv_folds <- shared$cv_folds
+  cv_data <- shared$cv_data
+  data_features <- shared$data_features
+  model_predictors <- shared$model_predictors
+  factor_predictors <- shared$factor_predictors
+  classes <- levels(y_train)
+  stopifnot(!anyNA(x_train), !anyNA(x_test))
+  set.seed(5003)
+
+  # ---- design-helpers ----
+  # Metrics used by the whole group: macro-F1 (primary), balanced accuracy, per-class recall.
+  class_metrics <- function(truth, pred) {
+    truth <- factor(truth, levels = classes); pred <- factor(pred, levels = classes)
+    cm <- table(Truth = truth, Pred = pred)
+    recall <- diag(cm) / rowSums(cm)
+    precision <- ifelse(colSums(cm) > 0, diag(cm) / colSums(cm), 0)
+    f1 <- ifelse(precision + recall > 0, 2 * precision * recall / (precision + recall), 0)
+    list(cm = cm, recall = recall, precision = precision, f1 = f1,
+         summary = c(macro_F1 = mean(f1), balanced_accuracy = mean(recall),
+                     accuracy = sum(diag(cm)) / sum(cm)))
+  }
+
+  class_weights <- function(y) {
+    w <- length(y) / (length(levels(y)) * as.numeric(table(y)))
+    setNames(w, levels(y))[as.character(y)]
+  }
+
+  ref_levels <- function(x) {
+    fixed <- c(Type = "Cat", Sex = "Female", has_pattern = "Pure", has_Name = "0")
+    sapply(names(Filter(is.factor, x)), function(v) {
+      if (v %in% names(fixed)) fixed[[v]] else names(which.max(table(x[[v]])))
+    })
+  }
+
+  # Build train/new design matrices with rules learned from the training part only.
+  # spec = "base": shared 8 predictors, linear standardised age.
+  # spec = "extended": + ns(log1p(age), 3) + Dog x log-age + age_missing flag.
+  build_design <- function(xtr, xnew, miss_tr, miss_new, spec = "base", drop = character(0)) {
+    refs <- ref_levels(xtr)
+    prep <- function(x) {
+      for (v in names(refs)) x[[v]] <- relevel(factor(x[[v]], levels = levels(xtr[[v]])), refs[[v]])
+      x[, setdiff(names(x), c("Age_Years_imputed", drop)), drop = FALSE]
+    }
+    ftr <- prep(xtr); fnew <- prep(xnew)
+    mm <- function(f) model.matrix(~ ., data = f)[, -1, drop = FALSE]
+    Xtr <- mm(ftr); Xnew <- mm(fnew)
+    mu <- mean(xtr$Age_Years_imputed); s <- sd(xtr$Age_Years_imputed)
+    if (spec == "base") {
+      Xtr <- cbind(Xtr, age_z = (xtr$Age_Years_imputed - mu) / s)
+      Xnew <- cbind(Xnew, age_z = (xnew$Age_Years_imputed - mu) / s)
+    } else {
+      la_tr <- log1p(xtr$Age_Years_imputed); la_new <- log1p(xnew$Age_Years_imputed)
+      basis <- ns(la_tr, df = 3)
+      B_tr <- basis; B_new <- predict(basis, la_new)
+      colnames(B_tr) <- colnames(B_new) <- paste0("age_ns", 1:3)
+      lm_ <- mean(la_tr); ls_ <- sd(la_tr)
+      Xtr <- cbind(Xtr, unclass(B_tr)[, 1:3],
+                   dog_x_logage = (xtr$Type == "Dog") * (la_tr - lm_) / ls_,
+                   age_missing = as.numeric(miss_tr))
+      Xnew <- cbind(Xnew, B_new,
+                    dog_x_logage = (xnew$Type == "Dog") * (la_new - lm_) / ls_,
+                    age_missing = as.numeric(miss_new))
+    }
+    colnames(Xtr) <- colnames(Xnew) <- make.names(colnames(Xtr))
+    # Drop any column that is constant in training (zero variance).
+    keep <- apply(Xtr, 2, function(z) length(unique(z)) > 1)
+    list(Xtr = Xtr[, keep, drop = FALSE], Xnew = Xnew[, keep, drop = FALSE])
+  }
+
+  # Age missing flag (missing DOB or negative age), aligned to shared rows.
+  miss_train <- is.na(train_raw$Age_Years)
+  miss_test <- is.na(test_raw$Age_Years)
+  fold_miss <- lapply(seq_along(cv_folds), function(k) list(
+    tr = miss_train[-cv_folds[[k]]], va = miss_train[cv_folds[[k]]]))
+  for (k in seq_along(cv_data)) {          # check alignment with the shared cv_data
+    stopifnot(identical(cv_data[[k]]$y_valid, y_train[cv_folds[[k]]]))
+  }
+
+  # ---- collinearity ----
+  X_base <- build_design(x_train, x_train, miss_train, miss_train, "base")$Xtr
+  vif <- sapply(colnames(X_base), function(j) {
+    r2 <- summary(lm(X_base[, j] ~ X_base[, -which(colnames(X_base) == j)]))$r.squared
+    1 / (1 - r2)
+  })
+  vif_tab <- tibble(Column = names(vif), VIF = unname(vif)) %>% arrange(desc(VIF))
+
+  fac <- names(Filter(is.factor, x_train))
+  cramer <- outer(fac, fac, Vectorize(function(a, b) {
+    t <- table(x_train[[a]], x_train[[b]])
+    s <- suppressWarnings(chisq.test(t, correct = FALSE)$statistic)
+    sqrt(unname(s) / (sum(t) * (min(dim(t)) - 1)))
+  }))
+  dimnames(cramer) <- list(fac, fac)
+
+  # ---- cv-models ----
+  alphas <- c(0, 0.25, 0.5, 0.75, 1)
+  n_lambda <- 40
+
+  fit_multinom <- function(X, y, w = NULL) {
+    df <- data.frame(X, .y = y)
+    if (is.null(w)) w <- rep(1, length(y))
+    multinom(.y ~ ., data = df, weights = w, maxit = 1000, MaxNWts = 10000, trace = FALSE)
+  }
+  pred_multinom <- function(fit, X) as.character(predict(fit, newdata = data.frame(X), type = "class"))
+
+  cv_rows <- list(); fold_rows <- list(); grid_rows <- list(); oof <- list()
+
+  # Majority-class reference and plain multinomial models
+  for (k in seq_along(cv_data)) {
+    d <- cv_data[[k]]
+    yva <- d$y_valid
+    maj <- names(which.max(table(d$y_train)))
+    m <- class_metrics(yva, rep(maj, length(yva)))
+    fold_rows[[length(fold_rows) + 1]] <- tibble(Model = "Majority class", Fold = k, !!!as.list(m$summary),
+                                                 !!!setNames(as.list(m$recall), paste0("recall_", classes)))
+    des <- build_design(d$x_train, d$x_valid, fold_miss[[k]]$tr, fold_miss[[k]]$va, "base")
+    for (mod in c("M0 multinom", "M1 multinom + weights")) {
+      w <- if (mod == "M0 multinom") NULL else class_weights(d$y_train)
+      fit <- fit_multinom(des$Xtr, d$y_train, w)
+      m <- class_metrics(yva, pred_multinom(fit, des$Xnew))
+      fold_rows[[length(fold_rows) + 1]] <- tibble(Model = mod, Fold = k, !!!as.list(m$summary),
+                                                   !!!setNames(as.list(m$recall), paste0("recall_", classes)))
+    }
+  }
+
+  # glmnet: shared lambda path per alpha from the full training data, then fold scores
+  tune_glmnet <- function(spec) {
+    full <- build_design(x_train, x_train, miss_train, miss_train, spec)
+    res <- list()
+    for (a in alphas) {
+      path <- glmnet(full$Xtr, y_train, family = "multinomial", type.multinomial = "grouped",
+                     alpha = a, weights = class_weights(y_train), nlambda = n_lambda,
+                     lambda.min.ratio = 1e-4)$lambda
+      for (k in seq_along(cv_data)) {
+        d <- cv_data[[k]]
+        des <- build_design(d$x_train, d$x_valid, fold_miss[[k]]$tr, fold_miss[[k]]$va, spec)
+        fit <- glmnet(des$Xtr, d$y_train, family = "multinomial", type.multinomial = "grouped",
+                      alpha = a, weights = class_weights(d$y_train), lambda = path)
+        pr <- predict(fit, des$Xnew, type = "class")
+        for (j in seq_along(path)) {
+          m <- class_metrics(d$y_valid, pr[, j])
+          res[[length(res) + 1]] <- tibble(spec = spec, alpha = a, lambda = path[j], Fold = k,
+                                           !!!as.list(m$summary),
+                                           !!!setNames(as.list(m$recall), paste0("recall_", classes)))
+        }
+      }
+    }
+    bind_rows(res)
+  }
+  grid <- bind_rows(tune_glmnet("base"), tune_glmnet("extended"))
+
+  grid_summary <- grid %>% group_by(spec, alpha, lambda) %>%
+    summarise(mean_macro_F1 = mean(macro_F1), se_macro_F1 = sd(macro_F1) / sqrt(n()),
+              mean_bal_acc = mean(balanced_accuracy), .groups = "drop")
+
+  pick_1se <- function(s) {
+    best <- s[which.max(s$mean_macro_F1), ]
+    cand <- s %>% filter(alpha == best$alpha, mean_macro_F1 >= best$mean_macro_F1 - best$se_macro_F1)
+    list(best = best, one_se = cand[which.max(cand$lambda), ])
+  }
+  sel <- lapply(c(base = "base", extended = "extended"),
+                function(sp) pick_1se(filter(grid_summary, spec == sp)))
+
+  for (sp in names(sel)) {
+    ch <- sel[[sp]]$one_se
+    rows <- grid %>% filter(spec == sp, alpha == ch$alpha, lambda == ch$lambda) %>%
+      mutate(Model = if (sp == "base") "M2 glmnet + weights" else "M3 glmnet + weights + age features") %>%
+      select(Model, Fold, macro_F1, balanced_accuracy, accuracy, starts_with("recall_"))
+    fold_rows[[length(fold_rows) + 1]] <- rows
+  }
+  fold_metrics <- bind_rows(fold_rows)
+
+  cv_summary <- fold_metrics %>% group_by(Model) %>%
+    summarise(macro_F1_sd = sd(macro_F1),
+              across(c(macro_F1, balanced_accuracy, accuracy, starts_with("recall_")), mean),
+              .groups = "drop") %>%
+    relocate(macro_F1_sd, .after = macro_F1) %>% arrange(desc(macro_F1))
+
+  tuned_tab <- bind_rows(lapply(names(sel), function(sp) bind_rows(
+    mutate(sel[[sp]]$best, rule = "best (lambda.min)"),
+    mutate(sel[[sp]]$one_se, rule = "1-SE (used)"))))
+
+  # ---- tuning-plot ----
+  p_tune <- ggplot(grid_summary, aes(x = log10(lambda), y = mean_macro_F1, colour = factor(alpha))) +
+    geom_line() + facet_wrap(~ spec) +
+    geom_vline(data = bind_rows(lapply(names(sel), function(sp) sel[[sp]]$one_se)),
+               aes(xintercept = log10(lambda)), linetype = "dashed") +
+    labs(x = expression(log[10](lambda)), y = "CV macro-F1", colour = expression(alpha),
+         title = "Elastic-net tuning on the shared folds (dashed = 1-SE choice)") +
+    theme_minimal(base_size = 9)
+
+  # ---- choose-final ----
+  lr_models <- cv_summary %>% filter(Model != "Majority class")
+  final_name <- lr_models$Model[1]
+  final_spec <- if (grepl("age features", final_name)) "extended" else "base"
+  final_is_glmnet <- grepl("glmnet", final_name)
+  final_weighted <- grepl("weights", final_name)
+  final_alpha <- if (final_is_glmnet) sel[[final_spec]]$one_se$alpha else NA
+  final_lambda <- if (final_is_glmnet) sel[[final_spec]]$one_se$lambda else NA
+
+  # ---- final-fit ----
+  fit_final <- function(xtr, ytr, xnew, mtr, mnew, drop = character(0)) {
+    des <- build_design(xtr, xnew, mtr, mnew, final_spec, drop)
+    w <- if (final_weighted) class_weights(ytr) else NULL
+    if (final_is_glmnet) {
+      fit <- glmnet(des$Xtr, ytr, family = "multinomial", type.multinomial = "grouped",
+                    alpha = final_alpha, weights = w, lambda = final_lambda)
+      prob <- predict(fit, des$Xnew, type = "response")[, , 1]
+    } else {
+      fit <- fit_multinom(des$Xtr, ytr, w)
+      prob <- predict(fit, newdata = data.frame(des$Xnew), type = "probs")
+    }
+    list(fit = fit, prob = prob, pred = classes[max.col(prob, ties.method = "first")],
+         cols = colnames(des$Xtr))
+  }
+  final <- fit_final(x_train, y_train, x_test, miss_train, miss_test)
+  test_m <- class_metrics(y_test, final$pred)
+
+  cv_final <- cv_summary %>% filter(Model == final_name)
+  metrics_out <- bind_rows(
+    tibble(Model = final_name, Evaluation = "5-fold CV (mean)", macro_F1 = cv_final$macro_F1,
+           balanced_accuracy = cv_final$balanced_accuracy, accuracy = cv_final$accuracy,
+           !!!as.list(unlist(cv_final[paste0("recall_", classes)]))),
+    tibble(Model = final_name, Evaluation = "Held-out test (20%)", !!!as.list(test_m$summary),
+           !!!setNames(as.list(test_m$recall), paste0("recall_", classes))))
+
+  per_class <- tibble(Class = classes, n_test = as.numeric(table(y_test)),
+                      Precision = test_m$precision, Recall = test_m$recall, F1 = test_m$f1)
+
+  # ---- confusion-matrix ----
+  cm_df <- as.data.frame(test_m$cm) %>% group_by(Truth) %>%
+    mutate(Row_pct = Freq / sum(Freq)) %>% ungroup()
+  p_cm <- ggplot(cm_df, aes(x = Pred, y = forcats::fct_rev(Truth), fill = Row_pct)) +
+    geom_tile(colour = "white") +
+    geom_text(aes(label = sprintf("%d\n(%.0f%%)", Freq, 100 * Row_pct)), size = 3) +
+    scale_fill_gradient(low = "#F0F4F8", high = "#1F78B4", labels = scales::percent) +
+    labs(x = "Predicted", y = "Actual", fill = "Row %",
+         title = "Logistic regression – held-out test confusion matrix") +
+    theme_minimal(base_size = 10) + theme(panel.grid = element_blank())
+
+  # ---- oof-predictions ----
+  # Out-of-fold predictions of the chosen model (useful for the group comparison).
+  oof_df <- bind_rows(lapply(seq_along(cv_data), function(k) {
+    d <- cv_data[[k]]
+    r <- fit_final(d$x_train, d$y_train, d$x_valid, fold_miss[[k]]$tr, fold_miss[[k]]$va)
+    data.frame(train_row = cv_folds[[k]], Animal.ID = train_raw$Animal.ID[cv_folds[[k]]],
+               Fold = k, truth = d$y_valid, pred = r$pred, round(r$prob, 5), check.names = FALSE)
+  })) %>% arrange(train_row)
+
+  # ---- odds-ratios ----
+  des_or <- build_design(x_train, x_test, miss_train, miss_test, "base")
+  X_or <- des_or$Xtr
+  X_or[, "age_z"] <- x_train$Age_Years_imputed          # odds ratio per year of age
+  colnames(X_or)[colnames(X_or) == "age_z"] <- "Age_years"
+  fit_or <- fit_multinom(X_or, y_train)
+  co <- coef(fit_or); se <- summary(fit_or)$standard.errors
+  or_tab <- expand.grid(Outcome = rownames(co), Term = colnames(co), stringsAsFactors = FALSE) %>%
+    mutate(coef = co[cbind(Outcome, Term)], se = se[cbind(Outcome, Term)],
+           OR = exp(coef), OR_low = exp(coef - 1.96 * se), OR_high = exp(coef + 1.96 * se),
+           p_value = 2 * pnorm(-abs(coef / se))) %>%
+    filter(Term != "(Intercept)") %>% arrange(Outcome, Term)
+
+  # Likelihood-ratio test for dropping each predictor (overall contribution)
+  drop_lr <- bind_rows(lapply(setdiff(names(x_train), character(0)), function(v) {
+    cols <- if (v == "Age_Years_imputed") "Age_years" else grep(paste0("^", make.names(v)), colnames(X_or), value = TRUE)
+    f0 <- fit_multinom(X_or[, setdiff(colnames(X_or), cols), drop = FALSE], y_train)
+    lr <- deviance(f0) - deviance(fit_or); dfree <- length(cols) * (length(classes) - 1)
+    tibble(Predictor = v, LR_chisq = lr, df = dfree, p_value = pchisq(lr, dfree, lower.tail = FALSE))
+  })) %>% arrange(desc(LR_chisq))
+
+  if (final_is_glmnet) {
+    cf <- coef(final$fit)
+    final_coef <- bind_rows(lapply(names(cf), function(cl) tibble(
+      Outcome = cl, Term = rownames(cf[[cl]]), coef = as.numeric(cf[[cl]]))))
+  } else {
+    cf <- coef(final$fit)
+    final_coef <- as.data.frame(as.table(cf)) %>% rename(Outcome = Var1, Term = Var2, coef = Freq)
+  }
+  if (final_is_glmnet) {
+    zero_terms <- final_coef %>% filter(Term != "(Intercept)") %>% group_by(Term) %>%
+      summarise(all_zero = all(coef == 0)) %>% filter(all_zero) %>% pull(Term)
+  }
+
+  # ---- or-plot ----
+  p_or <- or_tab %>%
+    mutate(Term = gsub("^primary\\.breed\\.group", "Breed: ", Term),
+           Term = gsub("^Base_Color", "Colour: ", Term),
+           Term = gsub("^Spayed\\.Neutered", "Spayed/Neutered: ", Term),
+           Term = gsub("^has_pattern", "Pattern: ", Term)) %>%
+    ggplot(aes(x = OR, y = Term)) +
+    geom_vline(xintercept = 1, linetype = "dashed", colour = "grey50") +
+    geom_errorbarh(aes(xmin = OR_low, xmax = OR_high), height = 0.2, colour = "grey40") +
+    geom_point(size = 1.4, colour = "#1F78B4") +
+    scale_x_log10() + facet_wrap(~ Outcome, nrow = 1) +
+    labs(x = "Odds ratio vs Adoption (log scale, 95% CI)", y = NULL,
+         title = "Multinomial LR odds ratios (reference outcome = Adoption)") +
+    theme_minimal(base_size = 8)
+
+  # ---- or-highlights ----
+  key_terms <- c("TypeDog", "Age_years", "has_Name1", "Spayed.NeuteredNo", "Spayed.NeuteredUnknown",
+                 "SexUnknown", "has_patternMixed")
+  or_of <- function(term, out) sprintf("%.2f", or_tab$OR[or_tab$Term == term & or_tab$Outcome == out])
+
+  # ---- sensitivity ----
+  sens <- list()
+  for (dr in list(c("Spayed.Neutered"), c("Spayed.Neutered", "has_Name"))) {
+    sc <- sapply(seq_along(cv_data), function(k) {
+      d <- cv_data[[k]]
+      r <- fit_final(d$x_train, d$y_train, d$x_valid, fold_miss[[k]]$tr, fold_miss[[k]]$va, drop = dr)
+      class_metrics(d$y_valid, r$pred)$summary
+    })
+    sens[[length(sens) + 1]] <- tibble(Check = paste("CV without", paste(dr, collapse = " + ")),
+                                       !!!as.list(rowMeans(sc)))
+  }
+
+  # Temporal hold-out: reapply the shared training-only rules (steps 8-10).
+  apply_shared_rules <- function(tr, new) {
+    med_all <- median(tr$Age_Years, na.rm = TRUE)
+    meds <- tr %>% group_by(Type) %>% summarise(Age_Median = median(Age_Years, na.rm = TRUE), .groups = "drop")
+    top8 <- tr %>% filter(Primary.Breed != "Unknown") %>% count(Primary.Breed, name = "Count") %>%
+      arrange(desc(Count), Primary.Breed) %>% filter(row_number() <= 8) %>% pull(Primary.Breed)
+    f <- function(df) df %>% left_join(meds, by = "Type") %>%
+      mutate(Age_Years_imputed = case_when(!is.na(Age_Years) ~ Age_Years, !is.na(Age_Median) ~ Age_Median,
+                                           TRUE ~ med_all),
+             primary.breed.group = if_else(Primary.Breed %in% top8, Primary.Breed, "Other")) %>%
+      select(all_of(model_predictors))
+    a <- f(tr); b <- f(new)
+    for (v in factor_predictors) { a[[v]] <- factor(a[[v]]); b[[v]] <- factor(b[[v]], levels = levels(a[[v]])) }
+    list(x_tr = a, x_new = b)
+  }
+  outcome_dt <- as.Date(lubridate::parse_date_time(as.character(data_features$Outcome.Date),
+                        orders = c("mdy IMS p", "mdy HMS", "ymd HMS"), locale = "C", tz = "UTC", quiet = TRUE))
+  stopifnot(!anyNA(outcome_dt))
+  cut_date <- as.Date("2026-07-01")
+  tr_t <- data_features[outcome_dt < cut_date, ]; te_t <- data_features[outcome_dt >= cut_date, ]
+  sr <- apply_shared_rules(tr_t, te_t)
+  ok <- complete.cases(sr$x_new)
+  r_t <- fit_final(sr$x_tr, tr_t$Outcome.Group, sr$x_new[ok, ], is.na(tr_t$Age_Years), is.na(te_t$Age_Years)[ok])
+  m_t <- class_metrics(te_t$Outcome.Group[ok], r_t$pred)
+  sens[[length(sens) + 1]] <- tibble(Check = sprintf("Temporal hold-out (train n=%d, test n=%d, outcome >= %s)",
+                                                     nrow(tr_t), sum(ok), cut_date), !!!as.list(m_t$summary))
+  sens_tab <- bind_rows(tibble(Check = "Reference: chosen model, held-out test", !!!as.list(test_m$summary)),
+                        tibble(Check = "Reference: chosen model, CV", macro_F1 = cv_final$macro_F1,
+                               balanced_accuracy = cv_final$balanced_accuracy, accuracy = cv_final$accuracy),
+                        bind_rows(sens))
+
+  drift <- bind_rows(
+    as.data.frame(prop.table(table(tr_t$Outcome.Group))) %>% mutate(Period = "Train (before cut-off)"),
+    as.data.frame(prop.table(table(te_t$Outcome.Group))) %>% mutate(Period = "Test (after cut-off)")) %>%
+    pivot_wider(names_from = Var1, values_from = Freq)
+
+  # Retain all exported evidence from the original model workflow as objects.
+  test_predictions <- data.frame(
+    Animal.ID = test_raw$Animal.ID, truth = y_test, pred = final$pred,
+    round(final$prob, 5), check.names = FALSE
+  )
+  list(
+    cv_model_comparison = cv_summary,
+    cv_fold_metrics = fold_metrics,
+    cv_oof_predictions = oof_df,
+    glmnet_tuning_grid = grid_summary,
+    glmnet_tuning_fold_scores = grid,
+    tuned_hyperparameters = tuned_tab,
+    selected = list(name = final_name, specification = final_spec,
+                    is_glmnet = final_is_glmnet, weighted = final_weighted,
+                    alpha = final_alpha, lambda = final_lambda),
+    metrics_summary = metrics_out,
+    test_per_class = per_class,
+    test_predictions = test_predictions,
+    confusion_matrix_test = as.data.frame.matrix(test_m$cm),
+    sensitivity_checks = sens_tab,
+    temporal_class_distribution = drift,
+    temporal_split = data.frame(
+      Cut_date = cut_date, Training_rows = nrow(tr_t),
+      Test_rows = nrow(te_t), Evaluated_test_rows = sum(ok),
+      Excluded_test_rows = sum(!ok)
+    ),
+    vif_base_design = vif_tab,
+    cramer_v = cramer,
+    odds_ratios_vs_adoption = or_tab,
+    drop1_likelihood_ratio = drop_lr,
+    final_model_coefficients = final_coef,
+    all_zero_terms = if (final_is_glmnet) zero_terms else character(0),
+    plots = list(tuning_curve = p_tune, confusion_matrix = p_cm,
+                 odds_ratios = p_or),
+    final_model = final$fit,
+    odds_ratio_model = fit_or
+  )
+})
+```
+
+```{r compute-random-forest, include=FALSE}
+rf_results <- local({
+  # Start from the shared preprocessing RNG state, independently of chunk order.
+  if (!is.null(shared$rng_state))
+    assign(".Random.seed", shared$rng_state, envir = .GlobalEnv)
+  suppressPackageStartupMessages({
+    library(dplyr)
+    library(ranger)
+  })
+  cv_data <- shared$cv_data
+  cv_folds <- shared$cv_folds
+  y_train <- shared$y_train
+  x_train <- shared$x_train
+  y_test <- shared$y_test
+  x_test <- shared$x_test
+  stopifnot(length(cv_data) == 5L)
+
+  # Retain every analysis output in memory for the report tables and checks.
+  results <- list()
+  keep_result <- function(x, name) {
+    results[[sub("\\.csv$", "", name)]] <<- x
+    invisible(x)
+  }
+
+  # Original member baseline: default ranger settings, fitted on full training.
+  # This held-out result is descriptive; it is not used to select the CV grid.
+  rf_baseline <- ranger(x = x_train, y = y_train, seed = 5003)
+  rf_baseline_pred <- predict(rf_baseline, data = x_test)$predictions
+  rf_baseline_recall <- rf_baseline_f1 <- numeric(length(levels(y_test)))
+  names(rf_baseline_recall) <- names(rf_baseline_f1) <- levels(y_test)
+  for (class in levels(y_test)) {
+    actual_count <- sum(y_test == class)
+    predicted_count <- sum(rf_baseline_pred == class)
+    correct_count <- sum(y_test == class & rf_baseline_pred == class)
+    rf_baseline_recall[class] <- correct_count / actual_count
+    rf_baseline_f1[class] <- 2 * correct_count / (actual_count + predicted_count)
+  }
+  keep_result(data.frame(
+    Model = "Baseline RF", Macro_F1 = mean(rf_baseline_f1),
+    Balanced_Accuracy = mean(rf_baseline_recall), Accuracy = mean(rf_baseline_pred == y_test)
+  ), "rf_baseline_holdout_metrics.csv")
+  keep_result(data.frame(Test_Row = seq_along(y_test), Actual = as.character(y_test),
+                         Predicted = as.character(rf_baseline_pred)),
+              "rf_baseline_holdout_predictions.csv")
+  rm(rf_baseline)
+
+  # ---- RF CV (Daun grid on shared folds) ----
+  macro_f1 <- function(actual, predicted) {
+    classes <- levels(actual)
+    mean(sapply(classes, function(cl) {
+      tp <- sum(actual == cl & predicted == cl)
+      pred_n <- sum(predicted == cl)
+      act_n <- sum(actual == cl)
+      if (act_n + pred_n == 0) return(0)
+      2 * tp / (act_n + pred_n)
+    }))
+  }
+  bal_acc <- function(actual, predicted) {
+    classes <- levels(actual)
+    mean(sapply(classes, function(cl) {
+      act_n <- sum(actual == cl)
+      if (act_n == 0) return(NA_real_)
+      sum(actual == cl & predicted == cl) / act_n
+    }), na.rm = TRUE)
+  }
+
+  rf_grid <- expand.grid(num.trees = c(100, 300, 500), mtry = c(2, 4, 8))
+  rf_cv_results <- data.frame()
+  candidate_predictions <- vector("list", nrow(rf_grid))
+  for (i in seq_len(nrow(rf_grid))) {
+    candidate_predictions[[i]] <- vector("list", length(cv_data))
+    for (k in seq_along(cv_data)) {
+      fold <- cv_data[[k]]
+      rf_model <- ranger(
+        x = fold$x_train, y = fold$y_train,
+        num.trees = rf_grid$num.trees[i],
+        mtry = rf_grid$mtry[i], seed = 5003 + k
+      )
+      preds <- predict(rf_model, data = fold$x_valid)$predictions
+      candidate_predictions[[i]][[k]] <- preds
+      rf_cv_results <- rbind(rf_cv_results, data.frame(
+        num.trees = rf_grid$num.trees[i], mtry = rf_grid$mtry[i],
+        Fold = k,
+        Macro_F1 = macro_f1(fold$y_valid, preds),
+        Balanced_Accuracy = bal_acc(fold$y_valid, preds),
+        Accuracy = mean(preds == fold$y_valid)
+      ))
+    }
+    message(sprintf("Random forest grid %d/%d complete", i, nrow(rf_grid)))
+  }
+
+  rf_cv_summary <- rf_cv_results %>%
+    group_by(num.trees, mtry) %>%
+    summarise(
+      Mean_Macro_F1 = mean(Macro_F1),
+      SD_Macro_F1 = sd(Macro_F1),
+      Mean_Balanced_Accuracy = mean(Balanced_Accuracy),
+      Mean_Accuracy = mean(Accuracy),
+      .groups = "drop"
+    ) %>%
+    arrange(desc(Mean_Macro_F1))
+
+  keep_result(rf_cv_results, "rf_cv_fold_scores.csv")
+  keep_result(rf_cv_summary, "rf_cv_summary.csv")
+
+  rf_best <- rf_cv_summary[1, ]
+  selected_index <- which(rf_grid$num.trees == rf_best$num.trees &
+                            rf_grid$mtry == rf_best$mtry)
+  # Keep exactly the predictions used to score the selected grid candidate.
+  # A second prediction call can break tied class votes differently.
+  best_preds <- candidate_predictions[[selected_index]]
+  best_actual <- lapply(cv_data, `[[`, "y_valid")
+  actual <- factor(unlist(best_actual), levels = levels(y_train))
+  predicted <- factor(unlist(best_preds), levels = levels(y_train))
+  per_class <- bind_rows(lapply(levels(actual), function(cl) {
+    tp <- sum(actual == cl & predicted == cl)
+    fp <- sum(actual != cl & predicted == cl)
+    fn <- sum(actual == cl & predicted != cl)
+    prec <- ifelse(tp + fp == 0, 0, tp / (tp + fp))
+    rec <- ifelse(tp + fn == 0, 0, tp / (tp + fn))
+    f1 <- ifelse(prec + rec == 0, 0, 2 * prec * rec / (prec + rec))
+    data.frame(Class = cl, Support = sum(actual == cl), Precision = prec, Recall = rec, F1 = f1)
+  }))
+  keep_result(per_class, "rf_oof_per_class.csv")
+  pooled <- data.frame(
+    Model = "Random Forest (CV-selected)",
+    Macro_F1_pooled_oof = mean(per_class$F1),
+    Balanced_Accuracy_pooled_oof = mean(per_class$Recall),
+    Accuracy_pooled_oof = mean(actual == predicted),
+    Mean_CV_Macro_F1 = rf_best$Mean_Macro_F1,
+    SD_CV_Macro_F1 = rf_best$SD_Macro_F1,
+    Mean_CV_Balanced_Accuracy = rf_best$Mean_Balanced_Accuracy,
+    num.trees = rf_best$num.trees,
+    mtry = rf_best$mtry
+  )
+  keep_result(pooled, "rf_selected_metrics.csv")
+
+
+  # Reconstruct row-aligned predictions so all models can be verified together.
+  oof_pred <- rep(NA_character_, length(y_train))
+  fold_id <- integer(length(y_train))
+  for (k in seq_along(cv_folds)) {
+    oof_pred[cv_folds[[k]]] <- as.character(best_preds[[k]])
+    fold_id[cv_folds[[k]]] <- k
+  }
+  stopifnot(!anyNA(oof_pred))
+  keep_result(data.frame(Training_Row = seq_along(y_train),
+                         Actual = as.character(y_train), Predicted = oof_pred,
+                         Fold = fold_id), "rf_selected_oof_predictions.csv")
+  results
+})
+```
+
+```{r compute-svm, include=FALSE}
+# Complete RBF SVM workflow, evaluated within this R Markdown document.
+# Uses the shared training partition and training-only CV folds prepared above.
+# Baseline, all 18 tuning candidates, weighted comparison and full-training
+# refit are recomputed. No saved result files or external scripts are read.
+svm_results <- local({
+  stopifnot(is.environment(shared))
+  if (!requireNamespace("e1071", quietly = TRUE)) {
+    stop("The SVM workflow requires the e1071 package.")
+  }
+
+  svm_metrics <- function(truth, prediction, classes = levels(truth)) {
+    stopifnot(length(truth) == length(prediction), length(truth) > 0L,
+              !anyNA(truth), !anyNA(prediction),
+              all(as.character(truth) %in% classes),
+              all(as.character(prediction) %in% classes))
+    cm <- table(Actual = factor(truth, levels = classes),
+                Predicted = factor(prediction, levels = classes))
+    tp <- diag(cm)
+    support <- rowSums(cm)
+    predicted_n <- colSums(cm)
+    recall <- ifelse(support > 0, tp / support, 0)
+    precision <- ifelse(predicted_n > 0, tp / predicted_n, 0)
+    # This also handles a class that the classifier never predicts.
+    f1 <- ifelse(support + predicted_n > 0, 2 * tp / (support + predicted_n), 0)
+    per_class <- data.frame(Class = classes, Support = as.integer(support),
+                            Precision = as.numeric(precision),
+                            Recall = as.numeric(recall), F1 = as.numeric(f1))
+    list(summary = data.frame(Macro_F1 = mean(f1),
+                              Balanced_Accuracy = mean(recall),
+                              Accuracy = sum(tp) / sum(cm)),
+         per_class = per_class, confusion = cm)
+  }
+
+  svm_fit_encoder <- function(x) {
+    x <- as.data.frame(x)
+    age <- "Age_Years_imputed"
+    stopifnot(age %in% names(x), !anyNA(x), all(is.finite(x[[age]])))
+    categorical <- setdiff(names(x), age)
+    encoder <- list(predictors = names(x), age = age, categorical = categorical,
+                    levels = lapply(x[categorical], function(z) sort(unique(as.character(z)))),
+                    age_mean = mean(x[[age]]), age_sd = sd(x[[age]]), keep = NULL)
+    if (!is.finite(encoder$age_sd) || encoder$age_sd == 0) encoder$age_sd <- 1
+    encoded <- svm_apply_encoder(encoder, x)
+    # Determine constants using this training partition only.
+    encoder$keep <- apply(encoded, 2, function(z) length(unique(z)) > 1L)
+    stopifnot(any(encoder$keep))
+    encoder
+  }
+
+  svm_apply_encoder <- function(encoder, x) {
+    stopifnot(all(encoder$predictors %in% names(x)))
+    x <- as.data.frame(x)[encoder$predictors]
+    stopifnot(all(is.finite(x[[encoder$age]])))
+    blocks <- lapply(encoder$categorical, function(variable) {
+      value <- as.character(x[[variable]])
+      lev <- encoder$levels[[variable]]
+      mat <- vapply(lev, function(z) as.numeric(!is.na(value) & value == z),
+                    numeric(nrow(x)))
+      mat <- matrix(mat, nrow = nrow(x), ncol = length(lev))
+      colnames(mat) <- paste(variable, lev, sep = "=")
+      mat
+    })
+    encoded <- do.call(cbind, c(blocks, list(
+      Age_Years_imputed = (x[[encoder$age]] - encoder$age_mean) / encoder$age_sd
+    )))
+    colnames(encoded)[ncol(encoded)] <- encoder$age
+    storage.mode(encoded) <- "double"
+    if (!is.null(encoder$keep)) encoded <- encoded[, encoder$keep, drop = FALSE]
+    # Assessment-only/unseen categories (including common-preprocessing NAs)
+    # have an all-zero block rather than dropping the animal's row.
+    stopifnot(nrow(encoded) == nrow(x), all(is.finite(encoded)))
+    encoded
+  }
+
+  svm_class_weights <- function(y, weighting) {
+    if (weighting == "none") return(NULL)
+    freq <- table(y)
+    stopifnot(all(freq > 0))
+    # Mean observation weight is 1, keeping the C comparison interpretable.
+    setNames(length(y) / (length(freq) * as.numeric(freq)), names(freq))
+  }
+
+  svm_train <- function(x, y, cost, gamma_multiplier, weighting) {
+    e1071::svm(x = x, y = y, type = "C-classification", kernel = "radial",
+               cost = cost, gamma = gamma_multiplier / ncol(x), scale = FALSE,
+               class.weights = svm_class_weights(y, weighting),
+               probability = FALSE, fitted = FALSE, cachesize = 256)
+  }
+
+  svm_predict <- function(bundle, newdata) {
+    predict(bundle$model, svm_apply_encoder(bundle$encoder, newdata))
+  }
+
+  svm_run_cv <- function(cv_data, cv_folds, x_train, y_train) {
+    stopifnot(length(cv_data) == 5L, length(cv_folds) == 5L,
+              nrow(x_train) == length(y_train), !anyNA(x_train), !anyNA(y_train))
+    classes <- levels(y_train)
+    stopifnot(length(classes) == 5L,
+              identical(sort(as.integer(unlist(cv_folds))), seq_along(y_train)))
+    # Baseline = C=1, gamma=1/p, no class weights. It is one grid candidate.
+    grid <- expand.grid(C = c(0.1, 1, 10), Gamma_multiplier = c(0.25, 1, 4),
+                         Weighting = c("none", "inverse"), stringsAsFactors = FALSE)
+    grid$Candidate <- seq_len(nrow(grid))
+    baseline_id <- grid$Candidate[grid$C == 1 & grid$Gamma_multiplier == 1 &
+                                  grid$Weighting == "none"]
+    prepared <- lapply(seq_along(cv_data), function(k) {
+      fold <- cv_data[[k]]
+      stopifnot(identical(as.character(fold$y_valid),
+                          as.character(y_train[cv_folds[[k]]])),
+                nrow(fold$x_train) + nrow(fold$x_valid) == length(y_train),
+                all(table(fold$y_train) > 0), all(table(fold$y_valid) > 0))
+      encoder <- svm_fit_encoder(fold$x_train)
+      list(x_train = svm_apply_encoder(encoder, fold$x_train),
+           x_valid = svm_apply_encoder(encoder, fold$x_valid),
+           y_train = fold$y_train, y_valid = fold$y_valid,
+           encoder = encoder)
+    })
+    # Independent parameter candidates can run in local R worker processes.
+    # Default is sequential; set options(stat5003.svm.workers = 3L) before rendering
+    # to run up to three parameter candidates at once.
+    workers <- max(1L, min(3L, as.integer(getOption("stat5003.svm.workers", 1L))))
+    run_candidate <- function(i) {
+      candidate <- grid[i, ]
+      scores <- vector("list", length(prepared))
+      fold_predictions <- vector("list", length(prepared))
+      for (k in seq_along(prepared)) {
+        fold <- prepared[[k]]
+        t0 <- proc.time()[["elapsed"]]
+        model <- svm_train(fold$x_train, fold$y_train, candidate$C,
+                           candidate$Gamma_multiplier, candidate$Weighting)
+        pred <- predict(model, fold$x_valid)
+        metric <- svm_metrics(fold$y_valid, pred, classes)$summary
+        scores[[k]] <- cbind(
+          candidate, Fold = k, Gamma = candidate$Gamma_multiplier / ncol(fold$x_train),
+          Encoded_predictors = ncol(fold$x_train), metric,
+          Support_vectors = model$tot.nSV,
+          Seconds = proc.time()[["elapsed"]] - t0
+        )
+        fold_predictions[[k]] <- data.frame(
+          Row = cv_folds[[k]], Fold = k, Actual = as.character(fold$y_valid),
+          Predicted = as.character(pred), stringsAsFactors = FALSE)
+        progress <- sprintf("SVM %02d/%02d fold %d/5: C=%g gamma=%g/%d %s; macro-F1=%.4f (%.1fs)",
+                        i, nrow(grid), k, candidate$C, candidate$Gamma_multiplier,
+                        ncol(fold$x_train), candidate$Weighting, metric$Macro_F1,
+                        proc.time()[["elapsed"]] - t0)
+        message(progress)
+      }
+      result <- list(scores = do.call(rbind, scores), predictions = do.call(rbind, fold_predictions))
+      result
+    }
+    if (workers > 1L) {
+      cluster <- parallel::makePSOCKcluster(workers)
+      on.exit(parallel::stopCluster(cluster), add = TRUE)
+      parallel::clusterCall(cluster, function(paths) .libPaths(paths), .libPaths())
+      # Give workers an explicit, small scope. This prevents the enclosing
+      # knitting environment (and other fitted models) from being serialised.
+      worker_scope <- list2env(
+        list(grid = grid, prepared = prepared, classes = classes, cv_folds = cv_folds),
+        parent = globalenv()
+      )
+      worker_scope$svm_train <- svm_train
+      worker_scope$svm_class_weights <- svm_class_weights
+      worker_scope$svm_metrics <- svm_metrics
+      for (helper in c("svm_train", "svm_class_weights", "svm_metrics")) {
+        environment(worker_scope[[helper]]) <- worker_scope
+      }
+      worker_task <- run_candidate
+      environment(worker_task) <- worker_scope
+      candidate_results <- parallel::parLapplyLB(
+        cluster, seq_len(nrow(grid)), worker_task
+      )
+    } else {
+      candidate_results <- lapply(seq_len(nrow(grid)), run_candidate)
+    }
+    predictions <- lapply(candidate_results, `[[`, "predictions")
+    fold_scores <- do.call(rbind, lapply(candidate_results, `[[`, "scores"))
+    tuning <- do.call(rbind, lapply(seq_len(nrow(grid)), function(i) {
+      z <- fold_scores[fold_scores$Candidate == i, ]
+      cbind(grid[i, ], Mean_Macro_F1 = mean(z$Macro_F1), SD_Macro_F1 = sd(z$Macro_F1),
+            Mean_Balanced_Accuracy = mean(z$Balanced_Accuracy),
+            Mean_Accuracy = mean(z$Accuracy), Total_seconds = sum(z$Seconds))
+    }))
+    tuning <- tuning[order(-tuning$Mean_Macro_F1, tuning$SD_Macro_F1,
+                           tuning$C, tuning$Gamma_multiplier, tuning$Weighting), ]
+    rownames(tuning) <- NULL
+    best <- tuning[1, ]
+    baseline <- tuning[tuning$Candidate == baseline_id, ]
+    selected_oof <- predictions[[best$Candidate]]
+    selected_oof <- selected_oof[order(selected_oof$Row), ]
+    baseline_oof <- predictions[[baseline_id]]
+    baseline_oof <- baseline_oof[order(baseline_oof$Row), ]
+    stopifnot(identical(as.integer(selected_oof$Row), seq_along(y_train)),
+              identical(as.character(y_train), selected_oof$Actual))
+    oof_metrics <- svm_metrics(selected_oof$Actual, selected_oof$Predicted, classes)
+    best_weighted <- tuning[tuning$Weighting == "inverse", ][1, ]
+    weighted_oof <- predictions[[best_weighted$Candidate]]
+    weighted_metrics <- svm_metrics(weighted_oof$Actual, weighted_oof$Predicted, classes)
+    weighting_tradeoff <- rbind(
+      cbind(Variant = "Selected by macro-F1", oof_metrics$per_class),
+      cbind(Variant = "Best weighted SVM", weighted_metrics$per_class))
+    # One stable comparison row per variant for the group-wide model table.
+    comparison <- rbind(cbind(Model = "SVM baseline", baseline),
+                         cbind(Model = "SVM selected by CV", best))
+    encoder <- svm_fit_encoder(x_train)
+    final_model <- svm_train(svm_apply_encoder(encoder, x_train), y_train,
+                             best$C, best$Gamma_multiplier, best$Weighting)
+    bundle <- list(model = final_model, encoder = encoder, best = best,
+                    class_levels = classes,
+                    note = "Training-only refit. Holdout has NOT been evaluated.")
+    list(tuning = tuning, fold_scores = fold_scores, comparison = comparison,
+         selected_oof = selected_oof, baseline_oof = baseline_oof,
+         oof = oof_metrics, bundle = bundle,
+         best_weighted = best_weighted, weighting_tradeoff = weighting_tradeoff,
+         weighted_oof = weighted_oof, weighted_metrics = weighted_metrics)
+  }
+
+  svm_plot_results <- function(result) {
+    if (!requireNamespace("ggplot2", quietly = TRUE)) return(invisible(NULL))
+    tuning_plot <- result$tuning
+    tuning_plot$Text_colour <- ifelse(
+      tuning_plot$Mean_Macro_F1 > mean(range(tuning_plot$Mean_Macro_F1)), "white", "#17324d")
+    p_tuning <- ggplot2::ggplot(tuning_plot, ggplot2::aes(
+      x = factor(C), y = factor(Gamma_multiplier), fill = Mean_Macro_F1)) +
+      ggplot2::geom_tile(colour = "white") +
+      ggplot2::geom_text(ggplot2::aes(label = sprintf("%.3f", Mean_Macro_F1), colour = Text_colour), size = 5) +
+      ggplot2::scale_colour_identity() +
+      ggplot2::facet_wrap(~ Weighting) +
+      ggplot2::scale_fill_gradient(low = "#e8f3fa", high = "#12648a") +
+      ggplot2::labs(title = "SVM tuning: mean macro-F1 across shared five-fold CV",
+                     x = "Cost (C)", y = "Gamma multiplier (gamma = multiplier / p)", fill = "Macro-F1") +
+      ggplot2::theme_minimal(base_size = 12) + ggplot2::theme(
+        panel.grid = ggplot2::element_blank(),
+        plot.margin = ggplot2::margin(14, 18, 14, 14),
+        plot.title = ggplot2::element_text(size = 13))
+    cm <- as.data.frame(result$oof$confusion)
+    cm$Within_actual <- cm$Freq / rowSums(result$oof$confusion)[match(cm$Actual, rownames(result$oof$confusion))]
+    cm$Text_colour <- ifelse(cm$Within_actual > 0.5, "white", "#17324d")
+    p_cm <- ggplot2::ggplot(cm, ggplot2::aes(x = Predicted, y = Actual, fill = Within_actual)) +
+      ggplot2::geom_tile(colour = "white") +
+      ggplot2::geom_text(ggplot2::aes(label = sprintf("%d\n%.1f%%", Freq, 100 * Within_actual), colour = Text_colour), size = 3.5) +
+      ggplot2::scale_colour_identity() +
+      ggplot2::scale_y_discrete(limits = rev(result$oof$per_class$Class)) +
+      ggplot2::scale_fill_gradient(low = "#eef4f8", high = "#12648a", limits = c(0, 1)) +
+      ggplot2::labs(title = "Selected SVM: cross-validation confusion matrix",
+                     subtitle = "Out-of-fold predictions; same folds used for tuning",
+                     fill = "Row share") + ggplot2::theme_minimal(base_size = 12) +
+      ggplot2::theme(panel.grid = ggplot2::element_blank(),
+                      plot.margin = ggplot2::margin(14, 18, 14, 14),
+                      plot.title = ggplot2::element_text(size = 13),
+                      plot.subtitle = ggplot2::element_text(size = 10))
+    p_recall <- ggplot2::ggplot(result$oof$per_class, ggplot2::aes(x = Class, y = Recall)) +
+      ggplot2::geom_col(fill = "#12648a", width = 0.65) +
+      ggplot2::geom_text(ggplot2::aes(label = sprintf("%.1f%%", 100 * Recall)), vjust = -0.4) +
+      ggplot2::scale_y_continuous(limits = c(0, 1.05), breaks = seq(0, 1, 0.2),
+                                 labels = function(x) paste0(100 * x, "%")) +
+      ggplot2::labs(title = "Which outcomes does SVM identify?", x = NULL, y = "Out-of-fold recall") +
+      ggplot2::theme_minimal(base_size = 12)
+    invisible(list(tuning = p_tuning, confusion = p_cm, recall = p_recall))
+  }
+
+
+  result <- svm_run_cv(
+    shared$cv_data, shared$cv_folds, shared$x_train, shared$y_train
+  )
+  result$plots <- svm_plot_results(result)
+
+  # Flat result names match the tables formerly exported as separate CSVs.
+  result$baseline_vs_selected <- result$comparison
+  result$cv_fold_scores <- result$fold_scores
+  result$tuning_summary <- result$tuning
+  result$selected_oof_predictions <- result$selected_oof
+  result$baseline_oof_predictions <- result$baseline_oof
+  result$oof_per_class <- result$oof$per_class
+  result$oof_pooled_metrics <- result$oof$summary
+  result$oof_confusion_matrix <- as.data.frame.matrix(result$oof$confusion)
+  result$best_weighted_cv <- result$best_weighted
+  result$weighted_oof_predictions <- result$weighted_oof
+  result$svm_training_refit <- result$bundle
+  result$split_manifest <- data.frame(
+    Animal_ID = c(shared$train_raw$Animal.ID, shared$test_raw$Animal.ID),
+    Partition = c(rep("train", nrow(shared$train_raw)),
+                  rep("test", nrow(shared$test_raw))),
+    Row_in_partition = c(seq_len(nrow(shared$train_raw)),
+                         seq_len(nrow(shared$test_raw)))
+  )
+  result$data_audit <- data.frame(
+    Check = c("CSV rows", "Cat/dog rows", "Latest-intake animals",
+              "Training rows", "Reserved test rows"),
+    Count = c(nrow(shared$data), nrow(shared$data_selected),
+              nrow(shared$data_latest), nrow(shared$x_train), nrow(shared$x_test))
+  )
+  result$metric_definitions <- c(
+    "Balanced_Accuracy is mean class recall.",
+    "Mean_Macro_F1 is the unweighted mean of five fold macro-F1 scores; SD is their sample standard deviation.",
+    "Pooled OOF metrics pool all validation-fold predictions and can differ from fold means.",
+    "Selection maximises mean CV macro-F1 across 18 candidates (90 fits).",
+    "The same folds are used for tuning and reporting, so selected CV performance is a development estimate.",
+    "No test predictors or labels are used for fitting, tuning or selection; the test set is not scored for SVM.",
+    "The final SVM and its encoder are refitted on the complete training partition."
+  )
+  result$session_info <- utils::sessionInfo()
+  result
+})
+```
+
+```{r compute-xgboost, include=FALSE}
+xgb_results <- local({
+  # Start from the shared preprocessing RNG state, independently of chunk order.
+  if (!is.null(shared$rng_state))
+    assign(".Random.seed", shared$rng_state, envir = .GlobalEnv)
+  suppressPackageStartupMessages({
+    library(caret)
+    library(xgboost)
+  })
+  x_train <- shared$x_train
+  x_test <- shared$x_test
+  y_train <- shared$y_train
+  y_test <- shared$y_test
+  cv_data <- shared$cv_data
+  cv_folds <- shared$cv_folds
+  model_predictors <- shared$model_predictors
+  fold_id <- integer(length(y_train))
+  for (k in seq_along(cv_folds)) fold_id[cv_folds[[k]]] <- k
+  stopifnot(all(fold_id %in% seq_along(cv_folds)),
+            !anyDuplicated(unlist(cv_folds)),
+            length(unlist(cv_folds)) == length(y_train))
+
+  # Retain every analysis output in memory for the report tables and checks.
+  results <- list()
+  keep_result <- function(x, name) {
+    results[[sub("\\.csv$", "", name)]] <<- x
+    invisible(x)
+  }
+
+  outcome_levels <- levels(y_train)
+  n_classes <- length(outcome_levels)
+  xgb_seed <- 5003L
+  xgb_nrounds <- 150L
+  stopifnot(n_classes == 5L, identical(levels(y_test), outcome_levels), length(cv_data) == 5L)
+
+  class_metrics <- function(actual, predicted) {
+    actual <- factor(actual, levels = outcome_levels)
+    predicted <- factor(predicted, levels = outcome_levels)
+    stopifnot(length(actual) == length(predicted), !anyNA(actual), !anyNA(predicted))
+    do.call(rbind, lapply(outcome_levels, function(cl) {
+      tp <- sum(actual == cl & predicted == cl)
+      fp <- sum(actual != cl & predicted == cl)
+      fn <- sum(actual == cl & predicted != cl)
+      precision <- if (tp + fp > 0) tp / (tp + fp) else 0
+      recall <- if (tp + fn > 0) tp / (tp + fn) else 0
+      f1 <- if (precision + recall > 0) 2 * precision * recall / (precision + recall) else 0
+      data.frame(Class = cl, Support = sum(actual == cl), Precision = precision,
+                 Recall = recall, F1 = f1, stringsAsFactors = FALSE)
+    }))
+  }
+  score_predictions <- function(actual, predicted) {
+    pc <- class_metrics(actual, predicted)
+    data.frame(Macro_F1 = mean(pc$F1), Balanced_Accuracy = mean(pc$Recall),
+               Accuracy = mean(as.character(actual) == as.character(predicted)),
+               Weighted_F1 = weighted.mean(pc$F1, pc$Support))
+  }
+  confusion_table <- function(actual, predicted) {
+    tab <- table(Actual = factor(actual, levels = outcome_levels),
+                 Predicted = factor(predicted, levels = outcome_levels))
+    data.frame(Actual = rownames(tab), as.data.frame.matrix(tab), row.names = NULL,
+               check.names = FALSE)
+  }
+
+  encode_fold <- function(train, valid) {
+    encoder <- caret::dummyVars(~ ., data = train, fullRank = FALSE)
+    train_matrix <- as.matrix(predict(encoder, newdata = train))
+    valid_matrix <- as.matrix(predict(encoder, newdata = valid))
+    storage.mode(train_matrix) <- storage.mode(valid_matrix) <- "double"
+    stopifnot(identical(colnames(train_matrix), colnames(valid_matrix)),
+              !anyNA(train_matrix), !anyNA(valid_matrix))
+    list(train = train_matrix, valid = valid_matrix)
+  }
+
+  make_matrices <- function(train_x, train_y, valid_x, valid_y) {
+    encoded <- encode_fold(train_x, valid_x)
+    counts <- table(train_y)
+    class_weights <- length(train_y) / (n_classes * counts)
+    weights <- as.numeric(class_weights[as.character(train_y)])
+    list(
+      unweighted = xgb.DMatrix(encoded$train, label = as.integer(train_y) - 1L),
+      weighted = xgb.DMatrix(encoded$train, label = as.integer(train_y) - 1L, weight = weights),
+      valid = xgb.DMatrix(encoded$valid, label = as.integer(valid_y) - 1L),
+      train_y = train_y, valid_y = valid_y, feature_names = colnames(encoded$train)
+    )
+  }
+  cv_matrices <- lapply(cv_data, function(d) make_matrices(d$x_train, d$y_train, d$x_valid, d$y_valid))
+
+  # In R xgboost 1.x, reshape=TRUE requests an observation-by-class matrix.
+  # Recent versions return this matrix directly for multiclass predictions.
+  predict_classes <- function(model, dmat, expected_n) {
+    p <- if (utils::packageVersion("xgboost") < "3.0.0") {
+      predict(model, dmat, reshape = TRUE)
+    } else {
+      predict(model, dmat)
+    }
+    if (is.null(dim(p))) p <- matrix(p, ncol = n_classes, byrow = TRUE)
+    if (nrow(p) == n_classes && ncol(p) == expected_n && expected_n != n_classes) p <- t(p)
+    stopifnot(identical(dim(p), c(as.integer(expected_n), as.integer(n_classes))),
+              all(is.finite(p)), all(abs(rowSums(p) - 1) < 1e-5))
+    factor(outcome_levels[max.col(p, ties.method = "first")], levels = outcome_levels)
+  }
+  base_params <- list(booster = "gbtree", objective = "multi:softprob", num_class = n_classes,
+                      eval_metric = "mlogloss", seed = xgb_seed, nthread = 2L)
+
+  fit_config <- function(params, weighted, configuration, grid_id = NA_integer_) {
+    rows <- vector("list", length(cv_data))
+    oof_predictions <- rep(NA_character_, length(y_train))
+    for (k in seq_along(cv_data)) {
+      m <- cv_matrices[[k]]
+      fit <- xgb.train(params = c(base_params, params),
+                       data = if (weighted) m$weighted else m$unweighted,
+                       nrounds = xgb_nrounds, verbose = 0)
+      pred <- predict_classes(fit, m$valid, length(m$valid_y))
+      oof_predictions[cv_folds[[k]]] <- as.character(pred)
+      rows[[k]] <- cbind(data.frame(Configuration = configuration, Grid_ID = grid_id,
+                                    Fold = k, nrounds = xgb_nrounds),
+                         score_predictions(m$valid_y, pred))
+    }
+    stopifnot(!anyNA(oof_predictions))
+    list(folds = do.call(rbind, rows), predictions = factor(oof_predictions, levels = outcome_levels))
+  }
+  summarise_folds <- function(folds) {
+    data.frame(Mean_CV_Macro_F1 = mean(folds$Macro_F1), SD_CV_Macro_F1 = sd(folds$Macro_F1),
+               Mean_CV_Balanced_Accuracy = mean(folds$Balanced_Accuracy),
+               Mean_CV_Accuracy = mean(folds$Accuracy), Mean_CV_Weighted_F1 = mean(folds$Weighted_F1))
+  }
+
+  # A isolates ordinary XGBoost performance; A->B isolates the effect of weighting.
+  default_params <- list(max_depth = 6L, eta = 0.3)
+  A <- fit_config(default_params, FALSE, "A. Defaults, unweighted")
+  message("Completed A: unweighted defaults")
+  B <- fit_config(default_params, TRUE, "B. Defaults, balanced weights")
+  message("Completed B: weighted defaults")
+
+  tuning_grid <- expand.grid(max_depth = c(4L, 6L), eta = c(0.05, 0.10), subsample = 0.80,
+                             colsample_bytree = c(0.70, 0.85), min_child_weight = c(1, 3),
+                             KEEP.OUT.ATTRS = FALSE, stringsAsFactors = FALSE)
+  grid_fits <- vector("list", nrow(tuning_grid))
+  grid_summaries <- vector("list", nrow(tuning_grid))
+  for (i in seq_len(nrow(tuning_grid))) {
+    grid_fits[[i]] <- fit_config(as.list(tuning_grid[i, ]), TRUE,
+                                "C. Tuned, balanced weights", i)
+    grid_summaries[[i]] <- cbind(data.frame(Grid_ID = i), tuning_grid[i, ],
+                                summarise_folds(grid_fits[[i]]$folds))
+    message(sprintf("Completed configuration %d/%d", i, nrow(tuning_grid)))
+  }
+  grid_summary <- do.call(rbind, grid_summaries)
+  # The first configuration is retained if mean macro-F1 ties, matching the source analysis.
+  best_index <- which.max(grid_summary$Mean_CV_Macro_F1)
+  best_params <- as.list(tuning_grid[best_index, ])
+  C <- grid_fits[[best_index]]
+  configuration_summary <- do.call(rbind, lapply(list(A, B, C), function(x) {
+    cbind(data.frame(Configuration = x$folds$Configuration[1L]), summarise_folds(x$folds))
+  }))
+  keep_result(configuration_summary, "xgb_configuration_summary.csv")
+  keep_result(rbind(A$folds, B$folds, C$folds), "xgb_configuration_fold_scores.csv")
+  keep_result(do.call(rbind, lapply(grid_fits, `[[`, "folds")), "xgb_grid_fold_scores.csv")
+  keep_result(grid_summary, "xgb_grid_summary.csv")
+  keep_result(C$folds, "xgb_selected_oof_fold_scores.csv")
+  keep_result(data.frame(Training_Row = seq_along(y_train), Actual = as.character(y_train),
+                           Predicted = as.character(C$predictions), Fold = fold_id), "xgb_selected_oof_predictions.csv")
+  keep_result(class_metrics(y_train, C$predictions), "xgb_oof_per_class.csv")
+  keep_result(confusion_table(y_train, C$predictions), "xgb_oof_confusion_matrix.csv")
+  selected <- cbind(data.frame(Model = "XGBoost", nrounds = xgb_nrounds, seed = xgb_seed),
+                    tuning_grid[best_index, ], summarise_folds(C$folds),
+                    score_predictions(y_train, C$predictions))
+  keep_result(selected, "xgb_selected_metrics.csv")
+
+  # Majority baseline is selected within each training fold, then scored on its validation fold.
+  majority_oof <- rep(NA_character_, length(y_train))
+  majority_folds <- lapply(seq_along(cv_data), function(k) {
+    d <- cv_data[[k]]
+    majority <- names(which.max(table(d$y_train)))
+    pred <- rep(majority, length(d$y_valid))
+    majority_oof[cv_folds[[k]]] <<- pred
+    cbind(data.frame(Fold = k, Majority_Class = majority), score_predictions(d$y_valid, pred))
+  })
+  majority_folds <- do.call(rbind, majority_folds)
+  keep_result(majority_folds, "majority_cv_fold_scores.csv")
+  keep_result(cbind(data.frame(Model = "Majority class"), summarise_folds(majority_folds)),
+               "majority_cv_summary.csv")
+  keep_result(class_metrics(y_train, majority_oof), "majority_oof_per_class.csv")
+
+  # Holdout is scored after hyperparameter selection. It never determines parameters/rounds.
+  full <- make_matrices(x_train, y_train, x_test, y_test)
+  final_model <- xgb.train(params = c(base_params, best_params), data = full$weighted,
+                           nrounds = xgb_nrounds, verbose = 0)
+  holdout_pred <- predict_classes(final_model, full$valid, length(y_test))
+  keep_result(cbind(data.frame(Model = "XGBoost", nrounds = xgb_nrounds),
+                      score_predictions(y_test, holdout_pred)), "xgb_holdout_metrics.csv")
+  keep_result(class_metrics(y_test, holdout_pred), "xgb_holdout_per_class.csv")
+  keep_result(confusion_table(y_test, holdout_pred), "xgb_holdout_confusion_matrix.csv")
+  keep_result(data.frame(Test_Row = seq_along(y_test), Actual = as.character(y_test),
+                           Predicted = as.character(holdout_pred)), "xgb_holdout_predictions.csv")
+  majority <- names(which.max(table(y_train)))
+  keep_result(cbind(data.frame(Model = "Majority class", Majority_Class = majority),
+                      score_predictions(y_test, rep(majority, length(y_test)))), "majority_holdout_metrics.csv")
+  keep_result(cbind(data.frame(Majority_Class = majority),
+                      score_predictions(y_train, rep(majority, length(y_train)))), "majority_training_metrics.csv")
+
+  importance <- xgb.importance(feature_names = full$feature_names, model = final_model)
+  importance_by_predictor <- data.frame(
+    Predictor = model_predictors,
+    Gain = vapply(model_predictors, function(p) {
+      sum(importance$Gain[importance$Feature == p | startsWith(importance$Feature, paste0(p, "."))])
+    }, numeric(1)), stringsAsFactors = FALSE
+  )
+  importance_by_predictor <- importance_by_predictor[order(-importance_by_predictor$Gain), ]
+  stopifnot(abs(sum(importance_by_predictor$Gain) - 1) < 1e-5)
+  keep_result(importance_by_predictor, "xgb_feature_importance.csv")
+  keep_result(as.data.frame(importance), "xgb_encoded_feature_importance.csv")
+  keep_result(data.frame(Class = outcome_levels, Training = as.integer(table(y_train)),
+                           Holdout = as.integer(table(y_test))), "split_class_counts.csv")
+
+  results$final_model <- final_model
+  results$protocol <- c(
+    "150 boosting rounds for A/B/C and the final refit; no early stopping.",
+    "Seed 5003, two threads, five shared stratified folds; training-only transforms and weights.",
+    "Select the highest mean CV macro-F1; ties retain the first grid row.",
+    "The existing holdout was examined in previous project versions.",
+    paste("R", getRversion(), "; xgboost", utils::packageVersion("xgboost"))
+  )
+  results
+})
+```
+
+```{r compute-decision-tree, include=FALSE}
+dt_results <- local({
+  # Start from the shared preprocessing RNG state, independently of chunk order.
+  if (!is.null(shared$rng_state))
+    assign(".Random.seed", shared$rng_state, envir = .GlobalEnv)
+  suppressPackageStartupMessages(library(rpart))
+
+  # Retain every analysis output in memory for the report tables and checks.
+  results <- list()
+  keep_result <- function(x, name) {
+    results[[sub("\\.csv$", "", name)]] <<- x
+    invisible(x)
+  }
+
+  classes <- levels(shared$y_train)
+  stopifnot(
+    identical(classes,
+              c("Adoption", "Transfer", "Return", "Euthanasia", "Other")),
+    length(shared$cv_data) == 5L,
+    nrow(shared$x_train) == length(shared$y_train),
+    nrow(shared$x_test) == length(shared$y_test)
+  )
+
+  # Consistent metric definitions across all models.
+  class_metrics <- function(actual, predicted) {
+    actual <- factor(actual, levels = classes)
+    predicted <- factor(predicted, levels = classes)
+
+    stopifnot(
+      length(actual) == length(predicted),
+      !anyNA(actual),
+      !anyNA(predicted)
+    )
+
+    cm <- table(actual, predicted)
+    tp <- diag(cm)
+    support <- rowSums(cm)
+    n_predicted <- colSums(cm)
+
+    data.frame(
+      Class = classes,
+      Support = as.integer(support),
+      Precision = ifelse(n_predicted > 0, tp / n_predicted, 0),
+      Recall = ifelse(support > 0, tp / support, 0),
+      F1 = ifelse(
+        support + n_predicted > 0,
+        2 * tp / (support + n_predicted),
+        0
+      ),
+      row.names = NULL
+    )
+  }
+
+  metrics <- function(actual, predicted) {
+    pc <- class_metrics(actual, predicted)
+
+    c(
+      Macro_F1 = mean(pc$F1),
+      Balanced_Accuracy = mean(pc$Recall),
+      Accuracy = mean(actual == predicted),
+      Weighted_F1 = weighted.mean(pc$F1, pc$Support)
+    )
+  }
+
+  # Train and predict one classification tree.
+  fit_tree <- function(x_train, y_train, x_valid,
+                       cp, maxdepth, minsplit) {
+    train_df <- as.data.frame(x_train)
+    train_df$Outcome.Group <- factor(y_train, levels = classes)
+
+    model <- rpart::rpart(
+      Outcome.Group ~ .,
+      data = train_df,
+      method = "class",
+      control = rpart::rpart.control(
+        cp = cp,
+        maxdepth = maxdepth,
+        minsplit = minsplit,
+        xval = 0
+      ),
+      model = TRUE
+    )
+
+    valid_df <- as.data.frame(x_valid)
+
+    # Preserve the outcome class order, including classes not predicted.
+    predicted <- predict(model, newdata = valid_df, type = "class")
+    predicted <- factor(as.character(predicted), levels = classes)
+
+    list(model = model, predicted = predicted)
+  }
+
+  # A small, explicit complexity grid.
+  # Larger cp values penalise additional splits; maxdepth limits tree depth.
+  tree_grid <- expand.grid(
+    cp = c(0.001, 0.005, 0.01, 0.02),
+    maxdepth = c(3L, 5L, 8L),
+    minsplit = c(20L, 50L),
+    KEEP.OUT.ATTRS = FALSE,
+    stringsAsFactors = FALSE
+  )
+
+  # Score every candidate on the same five training-only CV folds.
+  grid_fold_rows <- list()
+  candidate_predictions <- vector("list", nrow(tree_grid))
+
+  for (i in seq_len(nrow(tree_grid))) {
+    cfg <- tree_grid[i, ]
+    candidate_predictions[[i]] <- vector("list", 5L)
+
+    for (k in seq_len(5L)) {
+      fold <- shared$cv_data[[k]]
+
+      fitted <- fit_tree(
+        x_train = fold$x_train,
+        y_train = fold$y_train,
+        x_valid = fold$x_valid,
+        cp = cfg$cp,
+        maxdepth = cfg$maxdepth,
+        minsplit = cfg$minsplit
+      )
+
+      candidate_predictions[[i]][[k]] <- fitted$predicted
+      fold_metrics <- metrics(fold$y_valid, fitted$predicted)
+
+      grid_fold_rows[[length(grid_fold_rows) + 1L]] <- data.frame(
+        Grid_ID = i,
+        Fold = k,
+        cp = cfg$cp,
+        maxdepth = cfg$maxdepth,
+        minsplit = cfg$minsplit,
+        Macro_F1 = unname(fold_metrics["Macro_F1"]),
+        Balanced_Accuracy = unname(fold_metrics["Balanced_Accuracy"]),
+        Accuracy = unname(fold_metrics["Accuracy"]),
+        Weighted_F1 = unname(fold_metrics["Weighted_F1"])
+      )
+    }
+  }
+
+  grid_fold_scores <- do.call(rbind, grid_fold_rows)
+
+  grid_summary <- do.call(
+    rbind,
+    lapply(split(grid_fold_scores, grid_fold_scores$Grid_ID), function(z) {
+      data.frame(
+        Grid_ID = z$Grid_ID[1],
+        cp = z$cp[1],
+        maxdepth = z$maxdepth[1],
+        minsplit = z$minsplit[1],
+        Mean_CV_Macro_F1 = mean(z$Macro_F1),
+        SD_CV_Macro_F1 = sd(z$Macro_F1),
+        Mean_CV_Balanced_Accuracy = mean(z$Balanced_Accuracy),
+        Mean_CV_Accuracy = mean(z$Accuracy),
+        Mean_CV_Weighted_F1 = mean(z$Weighted_F1)
+      )
+    })
+  )
+
+  # Deterministic tie-breaking: prefer higher macro-F1, then higher
+  # balanced accuracy, then shallower trees, then larger cp.
+  grid_summary <- grid_summary[
+    order(
+      -grid_summary$Mean_CV_Macro_F1,
+      -grid_summary$Mean_CV_Balanced_Accuracy,
+      grid_summary$maxdepth,
+      -grid_summary$cp,
+      grid_summary$minsplit
+    ),
+  ]
+
+  selected <- grid_summary[1, ]
+  selected_grid_id <- selected$Grid_ID
+
+  keep_result(grid_fold_scores, "decision_tree_grid_fold_scores.csv")
+  keep_result(grid_summary, "decision_tree_grid_summary.csv")
+  keep_result(selected, "decision_tree_selected_config.csv")
+
+  # Save one out-of-fold prediction for each training row, using the
+  # selected configuration and the original shared fold assignments.
+  oof_predictions <- rep(NA_character_, length(shared$y_train))
+  fold_id <- integer(length(shared$y_train))
+
+  for (k in seq_len(5L)) {
+    rows <- shared$cv_folds[[k]]
+    fold <- shared$cv_data[[k]]
+    pred <- candidate_predictions[[selected_grid_id]][[k]]
+
+    stopifnot(length(rows) == length(pred))
+
+    oof_predictions[rows] <- as.character(pred)
+    fold_id[rows] <- k
+  }
+
+  stopifnot(!anyNA(oof_predictions), all(fold_id %in% 1:5))
+
+  oof <- data.frame(
+    Training_Row = seq_along(shared$y_train),
+    Actual = as.character(shared$y_train),
+    Predicted = oof_predictions,
+    Fold = fold_id
+  )
+
+  keep_result(oof, "decision_tree_selected_oof_predictions.csv")
+
+  # Pooled out-of-fold performance.
+  oof_metrics <- metrics(oof$Actual, oof$Predicted)
+  oof_pc <- class_metrics(oof$Actual, oof$Predicted)
+
+  keep_result(
+    data.frame(
+      Metric = names(oof_metrics),
+      Value = as.numeric(oof_metrics)
+    ),
+    "decision_tree_oof_metrics.csv"
+  )
+  keep_result(oof_pc, "decision_tree_oof_per_class.csv")
+
+  # Per-fold metrics for the selected configuration.
+  selected_fold_scores <- do.call(
+    rbind,
+    lapply(seq_len(5L), function(k) {
+      rows <- oof$Fold == k
+      m <- metrics(oof$Actual[rows], oof$Predicted[rows])
+
+      data.frame(
+        Fold = k,
+        cp = selected$cp,
+        maxdepth = selected$maxdepth,
+        minsplit = selected$minsplit,
+        Macro_F1 = unname(m["Macro_F1"]),
+        Balanced_Accuracy = unname(m["Balanced_Accuracy"]),
+        Accuracy = unname(m["Accuracy"]),
+        Weighted_F1 = unname(m["Weighted_F1"])
+      )
+    })
+  )
+
+  keep_result(
+    selected_fold_scores,
+    "decision_tree_selected_oof_fold_scores.csv"
+  )
+
+  selected_cv_summary <- data.frame(
+    Model = "Decision tree",
+    Mean_CV_Macro_F1 = mean(selected_fold_scores$Macro_F1),
+    SD_CV_Macro_F1 = sd(selected_fold_scores$Macro_F1),
+    Mean_CV_Balanced_Accuracy =
+      mean(selected_fold_scores$Balanced_Accuracy),
+    Mean_CV_Accuracy = mean(selected_fold_scores$Accuracy),
+    Mean_CV_Weighted_F1 = mean(selected_fold_scores$Weighted_F1),
+    cp = selected$cp,
+    maxdepth = selected$maxdepth,
+    minsplit = selected$minsplit
+  )
+
+  keep_result(selected_cv_summary, "decision_tree_selected_metrics.csv")
+
+  # Final model: fit on the complete training partition, then score holdout.
+  final_fit <- fit_tree(
+    x_train = shared$x_train,
+    y_train = shared$y_train,
+    x_valid = shared$x_test,
+    cp = selected$cp,
+    maxdepth = selected$maxdepth,
+    minsplit = selected$minsplit
+  )
+
+  holdout <- data.frame(
+    Test_Row = seq_along(shared$y_test),
+    Actual = as.character(shared$y_test),
+    Predicted = as.character(final_fit$predicted)
+  )
+
+  keep_result(holdout, "decision_tree_holdout_predictions.csv")
+
+  holdout_metrics <- metrics(holdout$Actual, holdout$Predicted)
+  holdout_pc <- class_metrics(holdout$Actual, holdout$Predicted)
+
+  keep_result(
+    data.frame(
+      Metric = names(holdout_metrics),
+      Value = as.numeric(holdout_metrics)
+    ),
+    "decision_tree_holdout_metrics.csv"
+  )
+  keep_result(holdout_pc, "decision_tree_holdout_per_class.csv")
+
+  # Feature importance from the final training-only fit.
+  importance <- final_fit$model$variable.importance
+
+  if (is.null(importance) || length(importance) == 0L) {
+    importance_df <- data.frame(
+      Feature = character(),
+      Importance = numeric()
+    )
+  } else {
+    importance_df <- data.frame(
+      Feature = names(importance),
+      Importance = as.numeric(importance),
+      row.names = NULL
+    )
+    importance_df <- importance_df[
+      order(-importance_df$Importance, importance_df$Feature),
+    ]
+  }
+
+  keep_result(importance_df, "decision_tree_feature_importance.csv")
+
+  message("Decision-tree grid search, OOF evaluation, and holdout evaluation completed.")
+  message("Selected configuration: cp=", selected$cp,
+          ", maxdepth=", selected$maxdepth,
+          ", minsplit=", selected$minsplit)
+  message("Mean CV macro-F1: ",
+          round(selected_cv_summary$Mean_CV_Macro_F1, 4))
+  message("Holdout macro-F1: ",
+          round(unname(holdout_metrics["Macro_F1"]), 4))
+
+  results$final_model <- final_fit$model
+  results
+})
+```
+
+```{r verify-model-results, include=FALSE}
+# Recompute evidence from the predictions produced above; this never refits a model.
+validation_summary <- local({
+  classes <- levels(shared$y_train)
+  tolerance <- 1e-8
+  checks <- list()
+  record <- function(label, condition) {
+    if (!isTRUE(condition)) message("Validation failed: ", label)
+    stopifnot(isTRUE(condition))
+    checks[[length(checks) + 1L]] <<- data.frame(Check = label, Passed = TRUE)
+    invisible(TRUE)
+  }
+  close <- function(actual, expected, label) {
+    actual <- as.numeric(actual); expected <- as.numeric(expected)
+    record(label, length(actual) == length(expected) && length(actual) > 0L &&
+             all(is.finite(actual)) && all(is.finite(expected)) &&
+             all(abs(actual - expected) <= tolerance))
+  }
+  per_class <- function(actual, predicted) {
+    stopifnot(length(actual) == length(predicted), !anyNA(actual), !anyNA(predicted),
+              all(as.character(actual) %in% classes),
+              all(as.character(predicted) %in% classes))
+    cm <- table(factor(actual, levels = classes), factor(predicted, levels = classes))
+    tp <- diag(cm); support <- rowSums(cm); predicted_n <- colSums(cm)
+    data.frame(Class = classes, Support = as.numeric(support),
+               Precision = ifelse(predicted_n > 0, tp / predicted_n, 0),
+               Recall = ifelse(support > 0, tp / support, 0),
+               F1 = ifelse(support + predicted_n > 0, 2 * tp / (support + predicted_n), 0),
+               row.names = NULL)
+  }
+  metrics <- function(actual, predicted) {
+    pc <- per_class(actual, predicted)
+    c(Macro_F1 = mean(pc$F1), Balanced_Accuracy = mean(pc$Recall),
+      Accuracy = mean(as.character(actual) == as.character(predicted)),
+      Weighted_F1 = weighted.mean(pc$F1, pc$Support))
+  }
+  fold_metrics <- function(oof) {
+    do.call(rbind, lapply(seq_along(shared$cv_folds), function(k) {
+      z <- oof[oof$Fold == k, ]
+      cbind(data.frame(Fold = k), as.data.frame(as.list(metrics(z$Actual, z$Predicted))))
+    }))
+  }
+  check_pc <- function(computed, stored, label, support_name = "Support") {
+    record(paste(label, "class labels"), nrow(stored) == length(classes) &&
+             !anyDuplicated(stored$Class) && setequal(as.character(stored$Class), classes))
+    stored <- stored[match(classes, stored$Class), ]
+    for (column in c("Support", "Precision", "Recall", "F1")) {
+      expected_column <- if (column == "Support") support_name else column
+      close(computed[[column]], stored[[expected_column]], paste(label, column))
+    }
+  }
+  check_folds <- function(computed, stored, label,
+                          columns = c(Macro_F1 = "Macro_F1",
+                                      Balanced_Accuracy = "Balanced_Accuracy",
+                                      Accuracy = "Accuracy")) {
+    stored <- stored[order(stored$Fold), ]
+    record(paste(label, "five fold IDs"),
+           identical(as.integer(stored$Fold), seq_along(shared$cv_folds)))
+    for (column in names(columns))
+      close(computed[[column]], stored[[columns[[column]]]], paste(label, column))
+  }
+  check_summary <- function(folds, stored, label,
+                            columns = c(Macro_F1 = "Mean_CV_Macro_F1",
+                                        Balanced_Accuracy = "Mean_CV_Balanced_Accuracy",
+                                        Accuracy = "Mean_CV_Accuracy"),
+                            sd_column = "SD_CV_Macro_F1") {
+    record(paste(label, "one summary row"), nrow(stored) == 1L)
+    for (column in names(columns))
+      close(mean(folds[[column]]), stored[[columns[[column]]]], paste(label, column))
+    close(sd(folds$Macro_F1), stored[[sd_column]], paste(label, "macro-F1 SD"))
+  }
+  check_grid <- function(folds, summary, keys, label,
+                         columns = c(Macro_F1 = "Mean_CV_Macro_F1",
+                                     Balanced_Accuracy = "Mean_CV_Balanced_Accuracy",
+                                     Accuracy = "Mean_CV_Accuracy"),
+                         sd_column = "SD_CV_Macro_F1") {
+    record(paste(label, "grid size"), nrow(folds) == 5L * nrow(summary))
+    for (i in seq_len(nrow(summary))) {
+      use <- rep(TRUE, nrow(folds))
+      for (key in keys) use <- use & folds[[key]] == summary[[key]][i]
+      z <- folds[use, ]
+      record(paste(label, "candidate", i, "fold coverage"),
+             identical(sort(as.integer(z$Fold)), 1:5))
+      for (column in names(columns))
+        close(mean(z[[column]]), summary[[columns[[column]]]][i],
+              paste(label, "candidate", i, column))
+      close(sd(z$Macro_F1), summary[[sd_column]][i],
+            paste(label, "candidate", i, "macro-F1 SD"))
+    }
+  }
+
+  # Every animal belongs to one partition, and every training row to one CV fold.
+  record("Training/test animal IDs are disjoint",
+         length(intersect(shared$train_raw$Animal.ID, shared$test_raw$Animal.ID)) == 0L)
+  record("Training/test animal IDs are unique",
+         !anyDuplicated(shared$train_raw$Animal.ID) && !anyDuplicated(shared$test_raw$Animal.ID))
+  record("CV covers every training row exactly once",
+         identical(sort(as.integer(unlist(shared$cv_folds))), seq_along(shared$y_train)))
+  fold_id <- integer(length(shared$y_train))
+  for (k in seq_along(shared$cv_folds)) {
+    fold_id[shared$cv_folds[[k]]] <- k
+    record(paste("Shared validation labels, fold", k),
+           identical(as.character(shared$cv_data[[k]]$y_valid),
+                     as.character(shared$y_train[shared$cv_folds[[k]]])))
+  }
+  normalise_oof <- function(x, row, truth, predicted) {
+    data.frame(Training_Row = x[[row]], Fold = x$Fold,
+               Actual = as.character(x[[truth]]), Predicted = as.character(x[[predicted]]))
+  }
+  oof <- list(
+    Logistic = normalise_oof(lr_results$cv_oof_predictions, "train_row", "truth", "pred"),
+    Random_forest = rf_results$rf_selected_oof_predictions,
+    SVM = normalise_oof(svm_results$selected_oof_predictions, "Row", "Actual", "Predicted"),
+    XGBoost = xgb_results$xgb_selected_oof_predictions,
+    Decision_tree = dt_results$decision_tree_selected_oof_predictions
+  )
+  recomputed_folds <- recomputed_pc <- list()
+  for (name in names(oof)) {
+    x <- oof[[name]][order(oof[[name]]$Training_Row), ]
+    record(paste(name, "OOF training-row order"),
+           identical(as.integer(x$Training_Row), seq_along(shared$y_train)))
+    record(paste(name, "OOF labels and folds"),
+           identical(as.character(x$Actual), as.character(shared$y_train)) &&
+             identical(as.integer(x$Fold), fold_id))
+    record(paste(name, "OOF valid predictions"), !anyNA(x$Predicted) &&
+             all(as.character(x$Predicted) %in% classes))
+    oof[[name]] <- x
+    recomputed_folds[[name]] <- fold_metrics(x)
+    recomputed_pc[[name]] <- per_class(x$Actual, x$Predicted)
+  }
+  record("Logistic OOF animal IDs", identical(
+    as.character(lr_results$cv_oof_predictions$Animal.ID[
+      order(lr_results$cv_oof_predictions$train_row)]),
+    as.character(shared$train_raw$Animal.ID)))
+
+  # LR uses lower-case names and retains both ordinary and regularised model families.
+  lr_name <- lr_results$selected$name
+  lr_stored <- lr_results$cv_fold_metrics[lr_results$cv_fold_metrics$Model == lr_name, ]
+  lr_columns <- c(Macro_F1 = "macro_F1", Balanced_Accuracy = "balanced_accuracy", Accuracy = "accuracy")
+  check_folds(recomputed_folds$Logistic, lr_stored, "Logistic selected CV", lr_columns)
+  check_summary(recomputed_folds$Logistic,
+                lr_results$cv_model_comparison[lr_results$cv_model_comparison$Model == lr_name, ],
+                "Logistic selected summary", lr_columns, "macro_F1_sd")
+  lr_candidates <- lr_results$cv_model_comparison[
+    lr_results$cv_model_comparison$Model != "Majority class", ]
+  close(lr_candidates$macro_F1[lr_candidates$Model == lr_name],
+        max(lr_candidates$macro_F1), "Logistic family selection maximises mean CV macro-F1")
+  for (model in unique(lr_results$cv_fold_metrics$Model)) {
+    z <- lr_results$cv_fold_metrics[lr_results$cv_fold_metrics$Model == model, ]
+    z$Macro_F1 <- z$macro_F1; z$Balanced_Accuracy <- z$balanced_accuracy; z$Accuracy <- z$accuracy
+    check_summary(z, lr_results$cv_model_comparison[lr_results$cv_model_comparison$Model == model, ],
+                  paste("Logistic", model), lr_columns, "macro_F1_sd")
+  }
+  for (spec in unique(lr_results$glmnet_tuning_grid$spec)) {
+    grid <- lr_results$glmnet_tuning_grid[lr_results$glmnet_tuning_grid$spec == spec, ]
+    best <- grid[which.max(grid$mean_macro_F1), ]
+    eligible <- grid[grid$alpha == best$alpha &
+                       grid$mean_macro_F1 >= best$mean_macro_F1 - best$se_macro_F1, ]
+    chosen <- eligible[which.max(eligible$lambda), ]
+    stored <- lr_results$tuned_hyperparameters[
+      lr_results$tuned_hyperparameters$spec == spec &
+        lr_results$tuned_hyperparameters$rule == "1-SE (used)", ]
+    close(stored$alpha, chosen$alpha, paste("Logistic", spec, "1-SE alpha"))
+    close(stored$lambda, chosen$lambda, paste("Logistic", spec, "1-SE lambda"))
+  }
+
+  rf_selected <- rf_results$rf_selected_metrics
+  rf_folds <- rf_results$rf_cv_fold_scores[
+    rf_results$rf_cv_fold_scores$num.trees == rf_selected$num.trees &
+      rf_results$rf_cv_fold_scores$mtry == rf_selected$mtry, ]
+  check_folds(recomputed_folds$Random_forest, rf_folds, "Random forest selected CV")
+  check_pc(recomputed_pc$Random_forest, rf_results$rf_oof_per_class, "Random forest pooled OOF")
+  rf_summary_columns <- c(Macro_F1 = "Mean_Macro_F1", Balanced_Accuracy = "Mean_Balanced_Accuracy",
+                          Accuracy = "Mean_Accuracy")
+  check_grid(rf_results$rf_cv_fold_scores, rf_results$rf_cv_summary,
+             c("num.trees", "mtry"), "Random forest", rf_summary_columns, "SD_Macro_F1")
+  close(rf_selected$Mean_CV_Macro_F1, max(rf_results$rf_cv_summary$Mean_Macro_F1),
+        "Random forest selected grid maximum")
+  close(metrics(oof$Random_forest$Actual, oof$Random_forest$Predicted)[1:3],
+        unlist(rf_selected[c("Macro_F1_pooled_oof", "Balanced_Accuracy_pooled_oof",
+                             "Accuracy_pooled_oof")]), "Random forest pooled summary")
+
+  svm_selected <- svm_results$baseline_vs_selected[
+    svm_results$baseline_vs_selected$Model == "SVM selected by CV", ]
+  svm_folds <- svm_results$cv_fold_scores[svm_results$cv_fold_scores$Candidate == svm_selected$Candidate, ]
+  check_folds(recomputed_folds$SVM, svm_folds, "SVM selected CV")
+  check_pc(recomputed_pc$SVM, svm_results$oof_per_class, "SVM pooled OOF")
+  check_summary(recomputed_folds$SVM, svm_selected, "SVM selected summary",
+                rf_summary_columns, "SD_Macro_F1")
+  check_grid(svm_results$cv_fold_scores, svm_results$tuning_summary, "Candidate", "SVM",
+             rf_summary_columns, "SD_Macro_F1")
+  close(svm_selected$Mean_Macro_F1, max(svm_results$tuning_summary$Mean_Macro_F1),
+        "SVM selected grid maximum")
+  close(metrics(oof$SVM$Actual, oof$SVM$Predicted)[1:3],
+        unlist(svm_results$oof_pooled_metrics[c("Macro_F1", "Balanced_Accuracy", "Accuracy")]),
+        "SVM pooled summary")
+
+  four_columns <- c(Macro_F1 = "Macro_F1", Balanced_Accuracy = "Balanced_Accuracy",
+                     Accuracy = "Accuracy", Weighted_F1 = "Weighted_F1")
+  mean_four <- paste0("Mean_CV_", four_columns)
+  names(mean_four) <- names(four_columns)
+  for (name in c("XGBoost", "Decision_tree")) {
+    result <- if (name == "XGBoost") xgb_results else dt_results
+    prefix <- if (name == "XGBoost") "xgb" else "decision_tree"
+    check_folds(recomputed_folds[[name]], result[[paste0(prefix, "_selected_oof_fold_scores")]],
+                paste(name, "selected CV"), four_columns)
+    check_pc(recomputed_pc[[name]], result[[paste0(prefix, "_oof_per_class")]],
+             paste(name, "pooled OOF"))
+    check_summary(recomputed_folds[[name]], result[[paste0(prefix, "_selected_metrics")]],
+                  paste(name, "selected summary"), mean_four)
+    check_grid(result[[paste0(prefix, "_grid_fold_scores")]], result[[paste0(prefix, "_grid_summary")]],
+               "Grid_ID", name, mean_four)
+    close(result[[paste0(prefix, "_selected_metrics")]]$Mean_CV_Macro_F1,
+          max(result[[paste0(prefix, "_grid_summary")]]$Mean_CV_Macro_F1),
+          paste(name, "selected grid maximum"))
+  }
+  dt_grid <- dt_results$decision_tree_grid_summary
+  dt_best <- dt_grid[order(-dt_grid$Mean_CV_Macro_F1, -dt_grid$Mean_CV_Balanced_Accuracy,
+                           dt_grid$maxdepth, -dt_grid$cp, dt_grid$minsplit), ][1, ]
+  close(dt_results$decision_tree_selected_config$Grid_ID, dt_best$Grid_ID,
+        "Decision tree deterministic tie-breaking")
+  dt_pooled <- dt_results$decision_tree_oof_metrics
+  close(metrics(oof$Decision_tree$Actual, oof$Decision_tree$Predicted),
+        dt_pooled$Value[match(names(four_columns), dt_pooled$Metric)],
+        "Decision tree pooled summary")
+  close(metrics(oof$XGBoost$Actual, oof$XGBoost$Predicted),
+        unlist(xgb_results$xgb_selected_metrics[names(four_columns)]), "XGBoost pooled summary")
+
+  # Held-out predictions are checked separately and never affect selection.
+  check_holdout <- function(predictions, label) {
+    predictions <- predictions[order(predictions$Test_Row), ]
+    record(paste(label, "holdout rows and labels"),
+           identical(as.integer(predictions$Test_Row), seq_along(shared$y_test)) &&
+             identical(as.character(predictions$Actual), as.character(shared$y_test)))
+    metrics(predictions$Actual, predictions$Predicted)
+  }
+  lr_test <- lr_results$test_predictions
+  record("Logistic holdout animal IDs", identical(as.character(lr_test$Animal.ID),
+                                                 as.character(shared$test_raw$Animal.ID)))
+  lr_holdout <- data.frame(Test_Row = seq_len(nrow(lr_test)), Actual = as.character(lr_test$truth),
+                           Predicted = as.character(lr_test$pred))
+  lr_test_metric <- check_holdout(lr_holdout, "Logistic")
+  lr_test_stored <- lr_results$metrics_summary[grepl("Held-out", lr_results$metrics_summary$Evaluation), ]
+  close(lr_test_metric[1:3], unlist(lr_test_stored[unname(lr_columns)]), "Logistic holdout summary")
+  check_pc(per_class(lr_holdout$Actual, lr_holdout$Predicted), lr_results$test_per_class,
+           "Logistic holdout per class", "n_test")
+  for (name in c("XGBoost", "Decision_tree")) {
+    result <- if (name == "XGBoost") xgb_results else dt_results
+    prefix <- if (name == "XGBoost") "xgb" else "decision_tree"
+    predictions <- result[[paste0(prefix, "_holdout_predictions")]]
+    m <- check_holdout(predictions, name)
+    stored <- result[[paste0(prefix, "_holdout_metrics")]]
+    expected <- if (name == "XGBoost") unlist(stored[names(four_columns)]) else
+      stored$Value[match(names(four_columns), stored$Metric)]
+    close(m, expected, paste(name, "holdout summary"))
+    check_pc(per_class(predictions$Actual, predictions$Predicted),
+             result[[paste0(prefix, "_holdout_per_class")]], paste(name, "holdout per class"))
+  }
+  rf_test <- rf_results$rf_baseline_holdout_predictions
+  rf_test_metric <- check_holdout(rf_test, "Random forest baseline")
+  close(rf_test_metric[1:3], unlist(rf_results$rf_baseline_holdout_metrics[
+    c("Macro_F1", "Balanced_Accuracy", "Accuracy")]), "Random forest baseline holdout summary")
+
+  # Majority-class evidence is recomputed directly from training labels.
+  majority_prediction <- rep(NA_character_, length(shared$y_train))
+  for (k in seq_along(shared$cv_folds))
+    majority_prediction[shared$cv_folds[[k]]] <- names(which.max(table(shared$cv_data[[k]]$y_train)))
+  majority_oof <- data.frame(Actual = as.character(shared$y_train),
+                             Predicted = majority_prediction, Fold = fold_id)
+  majority_folds <- fold_metrics(majority_oof)
+  check_folds(majority_folds, xgb_results$majority_cv_fold_scores, "Majority CV", four_columns)
+  check_summary(majority_folds, xgb_results$majority_cv_summary, "Majority CV summary", mean_four)
+  check_pc(per_class(majority_oof$Actual, majority_oof$Predicted),
+           xgb_results$majority_oof_per_class, "Majority pooled OOF")
+  majority <- names(which.max(table(shared$y_train)))
+  close(metrics(shared$y_test, rep(majority, length(shared$y_test))),
+        unlist(xgb_results$majority_holdout_metrics[names(four_columns)]), "Majority holdout")
+  close(metrics(shared$y_train, rep(majority, length(shared$y_train))),
+        unlist(xgb_results$majority_training_metrics[names(four_columns)]), "Majority training")
+
+  do.call(rbind, checks)
+})
+```
+
+```{r assemble-report-results, include=FALSE}
+# Assemble the report directly from the models fitted above.
+lr_cv <- lr_results$cv_model_comparison
+rf_cv <- rf_results$rf_cv_summary
+svm_cv <- svm_results$baseline_vs_selected
+xgb_cv <- xgb_results$xgb_configuration_summary
+xgb_selected <- xgb_results$xgb_selected_metrics
+xgb_holdout <- xgb_results$xgb_holdout_metrics
+xgb_test_pc <- xgb_results$xgb_holdout_per_class
+xgb_importance <- xgb_results$xgb_feature_importance
+dt_cv <- dt_results$decision_tree_selected_metrics
+dt_holdout <- dt_results$decision_tree_holdout_metrics
+dt_test_pc <- dt_results$decision_tree_holdout_per_class
+dt_importance <- dt_results$decision_tree_feature_importance
+majority_cv <- xgb_results$majority_cv_summary
+majority_holdout <- xgb_results$majority_holdout_metrics
+majority_training <- xgb_results$majority_training_metrics
+lr_selected <- lr_cv[lr_cv$Model == lr_results$selected$name, ]
+lr_m3 <- lr_cv[grepl("^M3 ", lr_cv$Model), ]
+lr_base <- lr_cv[grepl("^M0 ", lr_cv$Model), ]
+rf_selected <- rf_cv[which.max(rf_cv$Mean_Macro_F1), ]
+rf_base <- rf_cv[rf_cv$num.trees == 500 & rf_cv$mtry == 2, ]
+svm_selected <- svm_cv[svm_cv$Model == "SVM selected by CV", ]
+svm_base <- svm_cv[svm_cv$Model == "SVM baseline", ]
+comparison <- data.frame(
+  Model = c(
+    "XGBoost",
+    "Random forest",
+    "RBF SVM",
+    paste0("Multinomial logistic (", sub(" .*", "", lr_results$selected$name), ")"),
+    "Decision tree",
+    "Majority class (baseline)"
+  ),
+  Macro_F1 = c(
+    xgb_selected$Mean_CV_Macro_F1,
+    rf_selected$Mean_Macro_F1,
+    svm_selected$Mean_Macro_F1,
+    lr_selected$macro_F1,
+    dt_cv$Mean_CV_Macro_F1,
+    majority_cv$Mean_CV_Macro_F1
+  ),
+  SD = c(
+    xgb_selected$SD_CV_Macro_F1,
+    rf_selected$SD_Macro_F1,
+    svm_selected$SD_Macro_F1,
+    lr_selected$macro_F1_sd,
+    dt_cv$SD_CV_Macro_F1,
+    majority_cv$SD_CV_Macro_F1
+  ),
+  Balanced_Accuracy = c(
+    xgb_selected$Mean_CV_Balanced_Accuracy,
+    rf_selected$Mean_Balanced_Accuracy,
+    svm_selected$Mean_Balanced_Accuracy,
+    lr_selected$balanced_accuracy,
+    dt_cv$Mean_CV_Balanced_Accuracy,
+    majority_cv$Mean_CV_Balanced_Accuracy
+  ),
+  Accuracy = c(
+    xgb_selected$Mean_CV_Accuracy,
+    rf_selected$Mean_Accuracy,
+    svm_selected$Mean_Accuracy,
+    lr_selected$accuracy,
+    dt_cv$Mean_CV_Accuracy,
+    majority_cv$Mean_CV_Accuracy
+  )
+)
+comparison <- comparison[order(-comparison$Macro_F1), ]
+rownames(comparison) <- NULL
+selected_model_name <- comparison$Model[which.max(comparison$Macro_F1)]
+lr_oof <- lr_results$cv_oof_predictions
+classes <- levels(y_train)
+pc_metrics <- function(actual, pred) {
+  cm <- table(factor(actual, levels = classes), factor(pred, levels = classes))
+  support <- rowSums(cm); predicted <- colSums(cm); tp <- diag(cm)
+  data.frame(Class = classes, Support = as.integer(support),
+             Precision = ifelse(predicted > 0, tp / predicted, 0),
+             Recall = tp / support, F1 = 2 * tp / (support + predicted))
+}
+pc_sources <- list(
+  XGBoost = xgb_results$xgb_oof_per_class,
+  `Random forest` = rf_results$rf_oof_per_class,
+  `RBF SVM` = svm_results$oof_per_class,
+  `Selected logistic` = pc_metrics(lr_oof$truth, lr_oof$pred),
+  `Decision tree` = dt_results$decision_tree_oof_per_class
+)
+recall_long <- bind_rows(lapply(names(pc_sources), function(model) {
+  transform(pc_sources[[model]], Model = model)
+}))
+recall_long$Class <- factor(recall_long$Class, levels = classes)
+recall_long$Model <- factor(recall_long$Model, levels = names(pc_sources))
+fmt <- function(x, digits = 3) sprintf(paste0("%.", digits, "f"), x)
+pct <- function(x, digits = 1) paste0(fmt(100 * x, digits), "%")
+comma <- function(x) format(x, big.mark = ",", scientific = FALSE, trim = TRUE)
+quality_value <- function(field) quality_summary$Missing_pct[quality_summary$Feature == field]
+age_by_outcome <- data.frame(Outcome = data_selected$Outcome.Group, Age = age_audit$Age_Years_raw) %>%
+  filter(is.finite(Age), Age >= 0) %>% group_by(Outcome) %>%
+  summarise(Median = median(Age), .groups = "drop")
+lr_sensitivity <- lr_results$sensitivity_checks
+
 eda_rate <- function(summary, level, outcome) {
   pct(summary$Prop[summary$Level == level & summary$Outcome.Group == outcome])
 }
-model_source_env <- new.env(parent = globalenv())
-sys.source("report_support/model_code_sections.R", envir = model_source_env)
-model_code <- model_source_env$model_code
 theme_set(theme_minimal(base_size = 10))
 palette_outcome <- eda$outcome_colours
 ```
@@ -99,7 +2922,7 @@ p_missing <- ggplot(miss, aes(reorder(Feature, Missing_pct), Missing_pct)) +
 p_class + p_missing + patchwork::plot_annotation(caption = "Figure 1. Initial cat-and-dog subset, before selecting one admission per animal.")
 ```
 
-```{r original-eda-source, eval=FALSE, fold_label="Show original EDA calculations and plotting source", code=readLines("report_support/eda_source.R")}
+```{r original-eda-source, eval=FALSE, fold_label="Show original EDA calculations and plotting source", code=knitr::knit_code$get("compute-eda")}
 ```
 
 ### Type, age and overlapping information
@@ -188,28 +3011,26 @@ We retain the latest intake timestamp for each animal, resolving ties by source 
 
 Outcome date/status, euthanasia reason, completed days in shelter, identifiers and administrative timestamps are excluded from predictors. Raw names, dates and text are replaced by their derived features. Imputation and breed grouping are re-estimated within each training fold, then applied to validation rows. Model-specific encoding and age transformations also use the corresponding training rows. Name, neutering status and the colour indicators remain recording-based proxies whose availability at admission requires verification.
 
-```{r shared-preprocessing-code, eval=FALSE, code=readLines("report_support/preprocessing.R")}
+```{r shared-preprocessing-code, eval=FALSE, code=knitr::knit_code$get("compute-preprocessing")}
 ```
 
 ## 5. Model Fitting
 
 ### Common fitting procedure
 
-Four fitted classifiers use the same eight core predictors and shared five-fold partitions. For each fold, preprocessing is learned from its training rows, the model is fitted to those rows, and predictions are recorded for the validation rows. Combining these predictions gives one out-of-fold prediction per training animal. Hyperparameters and feature changes are evaluated in Section 6; model comparison is reported in Section 7. The folded panels below contain the actual fitting source; each model's Section 6 panel contains its tuning, prediction and result-export code. Tables are calculated from those workflows' saved outputs. XGBoost was rerun for this report; the other three models use existing outputs checked against the available predictions and fold summaries. Rendering the report does not retrain the model grids. The decision-tree model is excluded from this review because its fitted results are not yet available.
+Five fitted classifiers use the same eight core predictors and shared five-fold partitions. For each fold, preprocessing is learned from its training rows, the model is fitted to those rows, and predictions are recorded for the validation rows. Combining these predictions gives one out-of-fold prediction per training animal. Hyperparameters and feature changes are evaluated in Section 6; model comparison is reported in Section 7. Each folded model panel below contains its complete fitting, tuning, prediction and result-calculation code. All preprocessing, model grids, predictions, checks and report tables are executed within this document. Knitting recomputes the results from the raw CSV; it does not read previously saved model outputs. Decision tree is included alongside logistic regression, random forest, SVM and XGBoost.
 
 ### Majority class (baseline)
 
 The common reference baseline predicts the most frequent training class for every animal, without using predictors. It is **Adoption** in each training fold. The majority class accounts for `r pct(max(prop.table(table(y_train))), 2)` of the full training partition, while the smallest class, Other, accounts for `r pct(min(prop.table(table(y_train))), 2)`.
 
-On the training labels, this rule achieves accuracy `r fmt(majority_training$Accuracy)` and weighted-F1 `r fmt(majority_training$Weighted_F1)`, but macro-F1 only `r fmt(majority_training$Macro_F1)` and balanced accuracy 0.200. This illustrates why prevalence-weighted scores can look substantial even when four outcomes are never predicted. The comparison table evaluates this baseline on validation folds, selecting the majority from each fold's training labels. It is a reference rule, separate from the four fitted model families and their own initial configurations.
-```{r majority-fitting-source, eval=FALSE, fold_label="Show majority-baseline calculation code", code=model_code$majority_fit}
-```
+On the training labels, this rule achieves accuracy `r fmt(majority_training$Accuracy)` and weighted-F1 `r fmt(majority_training$Weighted_F1)`, but macro-F1 only `r fmt(majority_training$Macro_F1)` and balanced accuracy 0.200. This illustrates why prevalence-weighted scores can look substantial even when four outcomes are never predicted. The comparison table evaluates this baseline on validation folds, selecting the majority from each fold's training labels. It is a reference rule, separate from the five fitted model families and their own initial configurations.
 
 
 ### Multinomial logistic regression
 
 The initial M0 model is fitted with `nnet::multinom`, using treatment-coded categories and training-standardised age. It estimates class probabilities through linear predictors for the class log-odds and assigns the class with the largest probability. This provides a relatively interpretable baseline for assessing whether nonlinear models add predictive value. Regularisation, class weights and nonlinear age features are evaluated in Section 6; the resulting M3 model is fitted with `glmnet`.
-```{r logistic-fitting-source, eval=FALSE, fold_label="Show logistic regression fitting and baseline CV code", code=model_code$lr_fit}
+```{r logistic-fitting-source, eval=FALSE, fold_label="Show logistic regression fitting and baseline CV code", code=knitr::knit_code$get("compute-logistic")}
 ```
 
 
@@ -221,7 +3042,7 @@ Random Forest combines many decision trees to capture non-linear relationships a
 
 The original baseline code below fits the full training partition and predicts the holdout. Section 6 compares the baseline and tuned settings using the shared validation folds; its reported CV scores do not come from these holdout predictions.
 
-```{r rf-fitting-source, eval=FALSE, fold_label="Show random forest baseline and fold-fitting code", code=model_code$rf_fit}
+```{r rf-fitting-source, eval=FALSE, fold_label="Show random forest baseline and fold-fitting code", code=knitr::knit_code$get("compute-random-forest")}
 ```
 
 
@@ -233,7 +3054,7 @@ Within each fold, the common preprocessing estimated species-specific median age
 
 The baseline used `C = 1`, `gamma = 1/p`, and no class weights, where `p` is the number of retained encoded predictors.
 
-```{r svm-fitting-source, eval=FALSE, fold_label="Show SVM encoding and fitting code", code=model_code$svm_fit}
+```{r svm-fitting-source, eval=FALSE, fold_label="Show SVM encoding and fitting code", code=knitr::knit_code$get("compute-svm")}
 ```
 
 
@@ -243,7 +3064,14 @@ We use XGBoost as a non-linear model for the classification. It benchmarks the n
 
 XGBoost is fitted with `xgboost::xgb.train`, using the five-class `multi:softprob` objective (Chen & Guestrin, 2016). The predicted class has the largest fitted probability. All configurations use **150 boosting rounds**, seed 5003 and no early stopping. **Configuration A is the XGBoost model baseline:** depth 6, learning rate 0.3 and no class weights; the row/column sampling fractions and minimum child weight retain their defaults of 1.
 
-```{r xgb-fitting-source, eval=FALSE, fold_label="Show XGBoost encoding, fitting and baseline CV code", code=model_code$xgb_fit}
+```{r xgb-fitting-source, eval=FALSE, fold_label="Show XGBoost encoding, fitting and baseline CV code", code=knitr::knit_code$get("compute-xgboost")}
+```
+
+### Decision tree
+
+A single classification tree is fitted with `rpart`, using the same eight predictors, training-only preprocessing and five folds. Splits use the default Gini criterion and no class weights. The complexity grid in Section 6 limits the tree's depth, minimum split size and complexity parameter. Internal `rpart` cross-validation is disabled (`xval = 0`) because the shared outer folds provide the selection scores.
+
+```{r decision-tree-fitting-source, eval=FALSE, fold_label="Show complete decision-tree fitting and tuning code", code=knitr::knit_code$get("compute-decision-tree")}
 ```
 
 ## 6. Model Improvement
@@ -254,7 +3082,7 @@ All improvement choices use the shared training folds and mean CV macro-F1. The 
 
 Starting from the M0 baseline, M1 adds inverse-frequency observation weights, w<sub>c</sub> = n/(5n<sub>c</sub>), computed from training labels. M2 adds a grouped elastic-net penalty. M3 replaces linear age with a three-degree-of-freedom natural spline of log(1 + age), adds a Dog × standardised log(1 + age) interaction, and includes an age-missing indicator. This allows age relationships to vary across species while controlling unstable coefficients.
 
-For M2 and M3, α ∈ {0, 0.25, 0.5, 0.75, 1} is compared along a path of up to 40 regularisation strengths. The path is generated from the full training partition; fold models estimate preprocessing and coefficients separately. After finding the best α, the largest λ within one standard error of its best mean macro-F1 is retained. The selected M3 uses α = 0.5, λ ≈ 0.026. Grouped shrinkage can remove encoded columns across classes; it does not necessarily remove a whole original categorical variable.
+For M2 and M3, α ∈ {0, 0.25, 0.5, 0.75, 1} is compared along a path of up to 40 regularisation strengths. The path is generated from the full training partition; fold models estimate preprocessing and coefficients separately. After finding the best α, the largest λ within one standard error of its best mean macro-F1 is retained. The selected logistic model uses α = `r lr_results$selected$alpha`, λ ≈ `r fmt(lr_results$selected$lambda)` when penalised. Grouped shrinkage can remove encoded columns across classes; it does not necessarily remove a whole original categorical variable.
 
 ```{r logistic-improvement, fold_label="Show logistic regression results-table code"}
 knitr::kable(lr_cv[match(c("M0 multinom", "M1 multinom + weights", "M2 glmnet + weights", "M3 glmnet + weights + age features"), lr_cv$Model),
@@ -264,9 +3092,7 @@ knitr::kable(lr_cv[match(c("M0 multinom", "M1 multinom + weights", "M2 glmnet + 
              caption = "Table 1. Logistic model improvement, means over the shared five folds.")
 ```
 
-M3 raises mean macro-F1 from `r fmt(lr_base$macro_F1)` to `r fmt(lr_selected$macro_F1)`, while reducing accuracy from `r fmt(lr_base$accuracy)` to `r fmt(lr_selected$accuracy)`. This reflects greater attention to uncommon outcomes rather than a uniform improvement in prediction.
-```{r logistic-tuning-source, eval=FALSE, fold_label="Show logistic regression tuning, prediction and export code", code=model_code$lr_improvement}
-```
+M3 changes mean macro-F1 from `r fmt(lr_base$macro_F1)` to `r fmt(lr_m3$macro_F1)`, and accuracy from `r fmt(lr_base$accuracy)` to `r fmt(lr_m3$accuracy)`. The selected logistic specification is **`r lr_results$selected$name`**. This reflects greater attention to uncommon outcomes rather than a uniform improvement in prediction.
 
 
 ### Random forest
@@ -285,10 +3111,8 @@ knitr::kable(rf_display, digits = 3, row.names = FALSE,
   caption = "Table 2. Random forest: baseline and selected configuration on the same five folds.")
 ```
 
-The selected **500-tree, mtry = 4** model increases mean macro-F1 from `r fmt(rf_base$Mean_Macro_F1)` to `r fmt(rf_selected$Mean_Macro_F1)`. No class weights are used.
+The selected **`r rf_selected$num.trees`-tree, mtry = `r rf_selected$mtry`** model increases mean macro-F1 from `r fmt(rf_base$Mean_Macro_F1)` to `r fmt(rf_selected$Mean_Macro_F1)`. No class weights are used.
 
-```{r rf-tuning-source, eval=FALSE, fold_label="Show random forest full CV, selection and export code", code=model_code$rf_improvement}
-```
 
 
 ### Radial-basis support vector machine
@@ -298,7 +3122,7 @@ A grid compared `C` in {0.1, 1, 10}, gamma multipliers in {0.25, 1, 4} applied t
 The selected configuration was **C = `r svm_selected$C`, gamma = `r svm_selected$Gamma_multiplier`/p, weighting = `r svm_selected$Weighting`**. Its mean CV macro-F1 was **`r fmt(svm_selected$Mean_Macro_F1)`**, compared with **`r fmt(svm_base$Mean_Macro_F1)`** for the baseline, a change of **`r sprintf("%+.3f", svm_selected$Mean_Macro_F1 - svm_base$Mean_Macro_F1)`**.
 
 ```{r svm-improvement-results, fold_label="Show SVM results-table code"}
-svm_weighted <- read_result("best_weighted_cv.csv", "SVM_week12/svm_results")
+svm_weighted <- svm_results$best_weighted_cv
 svm_columns <- c("C", "Gamma_multiplier", "Weighting", "Mean_Macro_F1", "Mean_Balanced_Accuracy", "Mean_Accuracy")
 svm_rows <- rbind(svm_base[, svm_columns], svm_selected[, svm_columns], svm_weighted[, svm_columns])
 svm_display <- data.frame(
@@ -314,8 +3138,6 @@ knitr::kable(svm_display, digits = 3, row.names = FALSE,
 
 The best inverse-weighted configuration had mean CV macro-F1 **`r fmt(svm_weighted$Mean_Macro_F1)`**, versus **`r fmt(svm_selected$Mean_Macro_F1)`** for the selected model. A small difference in mean macro-F1 does not establish superiority.
 
-```{r svm-tuning-source, eval=FALSE, fold_label="Show SVM full CV, selection, refit and export code", code=model_code$svm_improvement}
-```
 
 
 ### XGBoost
@@ -334,8 +3156,10 @@ knitr::kable(xgb_display[, c("Configuration", "Mean_CV_Macro_F1", "SD_CV_Macro_F
 
 The selected configuration (`max_depth` = `r xgb_selected$max_depth`, `eta` = `r xgb_selected$eta`, `colsample_bytree` = `r xgb_selected$colsample_bytree`, `min_child_weight` = `r xgb_selected$min_child_weight`) reached a mean macro-F1 of `r fmt(xgb_selected$Mean_CV_Macro_F1)` (SD `r fmt(xgb_selected$SD_CV_Macro_F1)`). Adding balanced weights changed mean macro-F1 from `r fmt(xgb_cv$Mean_CV_Macro_F1[1])` (A) to `r fmt(xgb_cv$Mean_CV_Macro_F1[2])` (B), and mean accuracy from `r fmt(xgb_cv$Mean_CV_Accuracy[1])` to `r fmt(xgb_cv$Mean_CV_Accuracy[2])`. Tuning changed mean macro-F1 from `r fmt(xgb_cv$Mean_CV_Macro_F1[2])` (B) to `r fmt(xgb_cv$Mean_CV_Macro_F1[3])` (C). Because the selected value is the maximum over 16 candidates, it is the selection criterion and not an independent performance estimate; the held-out result in Section 8 is reported separately.
 
-```{r xgb-tuning-source, eval=FALSE, fold_label="Show XGBoost weighting, grid search and export code", code=model_code$xgb_improvement}
-```
+
+### Decision tree
+
+We compare 24 configurations: `cp` in {0.001, 0.005, 0.01, 0.02}, `maxdepth` in {3, 5, 8}, and `minsplit` in {20, 50}. Selection maximises mean CV macro-F1; ties are resolved by balanced accuracy, shallower depth, larger `cp`, then smaller `minsplit`. The selected configuration uses **cp = `r dt_cv$cp`**, **maxdepth = `r dt_cv$maxdepth`** and **minsplit = `r dt_cv$minsplit`**. It achieves mean CV macro-F1 **`r fmt(dt_cv$Mean_CV_Macro_F1)`** (SD `r fmt(dt_cv$SD_CV_Macro_F1)`) and accuracy `r fmt(dt_cv$Mean_CV_Accuracy)`. The full grid and selected model are calculated in the decision-tree code panel in Section 5.
 
 ## 7. Model Evaluation & Selection
 
@@ -357,38 +3181,36 @@ knitr::kable(comparison_display, align = c("l", "r", "r", "r"), caption = "Table
 ```{r class-recall-comparison, fig.height=3.4}
 ggplot(recall_long, aes(Class, Recall, fill = Model)) +
   geom_col(position = position_dodge(width = .8), width = .75) +
-  scale_fill_manual(values = c("#3578A3", "#5A9975", "#B98342", "#8270A1")) +
+  scale_fill_manual(values = c("#3578A3", "#5A9975", "#B98342", "#8270A1", "#C96565")) +
   scale_y_continuous(limits = c(0, 1), labels = scales::percent) +
   labs(x = NULL, y = "Recall", fill = NULL,
-       caption = "Figure 5. Pooled out-of-fold recall for all four models; each animal is predicted outside its training fold.") +
+       caption = "Figure 5. Pooled out-of-fold recall for all five models; each animal is predicted outside its training fold.") +
   theme(legend.position = "bottom")
 ```
 
-**XGBoost is selected among the four completed models.** Its mean macro-F1 of `r fmt(xgb_selected$Mean_CV_Macro_F1)` exceeds random forest by `r fmt(xgb_selected$Mean_CV_Macro_F1 - rf_selected$Mean_Macro_F1)`; this small difference is not evidence of a decisive advantage. The practical distinction is its greater recall for Euthanasia and Other. Random forest and SVM achieve about 0.80 accuracy but identify few Euthanasia cases. Logistic M3 has lower macro-F1, although its stronger Return and Other recall makes it informative when missed cases are a priority.
+**`r selected_model_name` has the highest mean CV macro-F1 among the five completed models.** XGBoost's mean macro-F1 of `r fmt(xgb_selected$Mean_CV_Macro_F1)` differs from random forest by `r sprintf("%+.3f", xgb_selected$Mean_CV_Macro_F1 - rf_selected$Mean_Macro_F1)`; this small difference is not evidence of a decisive advantage. The practical distinction is its greater recall for Euthanasia and Other. Random forest and SVM achieve about 0.80 accuracy but identify few Euthanasia cases. The selected logistic model has lower macro-F1, although its stronger Return and Other recall makes it informative when missed cases are a priority. The single decision tree has mean macro-F1 `r fmt(dt_cv$Mean_CV_Macro_F1)`; its high accuracy coexists with weak recall for rare outcomes.
 
 XGBoost's lower accuracy (`r fmt(xgb_selected$Mean_CV_Accuracy)`) is a trade-off: improved attention to rare outcomes comes with more errors among common outcomes. Macro-F1 balances class precision and recall but does not encode a shelter's actual error costs. Staff would need to determine those costs before adopting a model or decision threshold.
 
 ## 8. Final Results & Conclusion
 
-### Held-out assessment
+### XGBoost held-out assessment
 
 After CV selection, the chosen XGBoost configuration is refitted on all `r comma(length(y_train))` training animals for the same 150 rounds and evaluated on the `r comma(length(y_test))` test animals. Test labels do not determine parameters or the number of rounds in this procedure. Earlier project versions had already reported results on this split; this is a reproduced assessment, not a newly blinded test.
 
-```{r xgb-final-fitting-source, eval=FALSE, fold_label="Show final XGBoost refit, test predictions and importance code", code=model_code$xgb_final}
-```
 
 ```{r holdout-overall}
-holdout_table <- data.frame(Model = c("Selected XGBoost", "Majority class (baseline)"),
+holdout_table <- data.frame(Model = c("XGBoost", "Majority class (baseline)"),
   `Macro-F1` = c(xgb_holdout$Macro_F1, majority_holdout$Macro_F1),
   `Balanced accuracy` = c(xgb_holdout$Balanced_Accuracy, majority_holdout$Balanced_Accuracy),
   Accuracy = c(xgb_holdout$Accuracy, majority_holdout$Accuracy), check.names = FALSE)
 knitr::kable(holdout_table, digits = 3, caption = "Table 6. Assessment on the same held-out animals.")
 knitr::kable(xgb_test_pc, digits = 3, col.names = c("Outcome", "Animals", "Precision", "Recall", "F1"),
-             caption = "Table 7. Selected XGBoost: per-class held-out performance.")
+             caption = "Table 7. XGBoost: per-class held-out performance.")
 ```
 
 ```{r holdout-confusion, fig.height=3.4}
-test_predictions <- read_result("xgb_holdout_predictions.csv")
+test_predictions <- xgb_results$xgb_holdout_predictions
 confusion <- as.data.frame(table(Actual = factor(test_predictions$Actual, levels = classes),
                                 Predicted = factor(test_predictions$Predicted, levels = classes))) %>%
   group_by(Actual) %>% mutate(Share = Freq / sum(Freq))
@@ -416,14 +3238,14 @@ importance_table <- data.frame(
   `Predictor ` = unname(predictor_names[xgb_importance$Predictor[5:8]]),
   `Gain share ` = pct(xgb_importance$Gain[5:8]), check.names = FALSE)
 knitr::kable(importance_table, align = c("l", "r", "l", "r"),
-  caption = "Table 8. Selected XGBoost: share of split gain, aggregated across each predictor's encoded columns.")
+  caption = "Table 8. XGBoost: share of split gain, aggregated across each predictor's encoded columns.")
 ```
 
 The Data Investigation Process connected the audit to implementation: repeated identifiers led to one record per animal, sparse breeds to training-based grouping, and imbalance to macro-F1 and per-class error analysis. Comparing unweighted, weighted and tuned models showed why a plausible adjustment does not necessarily improve the chosen metric. Shared folds allowed a consistent comparison; a stronger evaluation would fix the complete protocol before examining assessment results and reserve a later period for testing.
 
 ### Answer to the research question and limitations
 
-Recorded animal characteristics provide useful but incomplete information about shelter outcomes. Among the four completed classifiers, tuned weighted XGBoost has the highest mean CV macro-F1. Its held-out macro-F1 is `r fmt(xgb_holdout$Macro_F1)`. Its small advantage over random forest and its lower overall accuracy make the choice dependent on the importance of recognising less common outcomes. The results support further evaluation as an aid to staff review, rather than automated outcome decisions.
+Recorded animal characteristics provide useful but incomplete information about shelter outcomes. Among the five completed classifiers, **`r selected_model_name`** has the highest mean CV macro-F1. The tuned weighted XGBoost held-out macro-F1 is `r fmt(xgb_holdout$Macro_F1)`. The close CV scores of XGBoost and random forest, together with their different accuracy and recall profiles, make the choice dependent on the importance of recognising less common outcomes. The results support further evaluation as an aid to staff review, rather than automated outcome decisions.
 
 The largest practical concern is prediction-time availability. In the logistic sensitivity analysis, excluding spay/neuter status reduces mean CV macro-F1 from `r fmt(lr_selected$macro_F1)` to `r fmt(lr_sensitivity$macro_F1[grepl("^CV without Spayed.Neutered$", lr_sensitivity$Check)])`; excluding both that field and name reduces it to `r fmt(lr_sensitivity$macro_F1[grepl("^CV without Spayed.Neutered \\+ has_Name$", lr_sensitivity$Check)])`. This dependence does not prove leakage, but it makes verification of intake-time values essential. The same sensitivity checks have not been established for XGBoost.
 
@@ -445,19 +3267,22 @@ OpenAI Codex (GPT-5.6 and GPT-6, OpenAI, https://openai.com/codex/) assisted wit
 
 ## Reproducibility
 
-Figures are embedded in this HTML and all source panels are collapsed by default. Sections 4–8 show preprocessing, model fitting, tuning, prediction, evaluation and export code alongside the results they support. The accompanying source package retains the complete model files and data. The commands below regenerate each model's outputs, verify the results and render the report; they are not run during ordinary report rendering. R session information is included for SVM and the XGBoost run; reruns under other package versions can differ numerically.
+This Rmd contains all preprocessing, EDA, five model workflows, tuning, prediction, verification and report-generation code. Place it beside `Austin_Animal_Center_Outcomes_20260916.csv` and install the packages listed in the setup block. Knit to HTML in RStudio, or run the command below. A full render retrains all grids and may take several minutes or longer; no separate scripts, result CSVs or stylesheets are required. HTML source panels are collapsed by default, and figures and styles are embedded.
 
-```{r reproduce, eval=FALSE, fold_label="Show commands to reproduce the models and report"}
-# Run from the project root after installing the documented R packages.
-# Rebuild each original model workflow, retaining its expected working directory.
-rmarkdown::render("zilan/logistic_regression.Rmd")
-source("model_comparison/run_rf_cv.R")
-local({
-  previous_directory <- setwd("SVM_week12")
-  on.exit(setwd(previous_directory))
-  source("run_svm.R")
-})
-source("model_comparison/run_xgb_review.R")
-source("report_support/verify_results.R")
+```{r reproduce, eval=FALSE, fold_label="Show the single-file render command"}
 rmarkdown::render("STAT5003_A2_W01G04.Rmd")
+# Optional: use more SVM workers before rendering, if memory allows.
+# options(stat5003.svm.workers = 3L)
+```
+
+```{r verification-source, eval=FALSE, fold_label="Show in-memory result verification", code=knitr::knit_code$get("verify-model-results")}
+```
+
+```{r report-assembly-source, eval=FALSE, fold_label="Show report-table assembly", code=knitr::knit_code$get("assemble-report-results")}
+```
+
+```{r runtime-session, echo=FALSE, results='asis'}
+cat('<details class="r-source"><summary>Show R and package versions</summary><pre>',
+    htmltools::htmlEscape(paste(capture.output(sessionInfo()), collapse = "\n")),
+    '</pre></details>')
 ```
