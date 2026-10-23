@@ -2172,6 +2172,26 @@ dt_results <- local({
     nrow(shared$x_test) == length(shared$y_test)
   )
 
+  # The saved fold indices must partition training rows exactly once and have
+  # the same order as the preprocessed validation labels used by each fit.
+  validation_rows <- unlist(shared$cv_folds, use.names = FALSE)
+  stopifnot(
+    !anyNA(validation_rows),
+    !anyDuplicated(validation_rows),
+    identical(sort(as.integer(validation_rows)), seq_along(shared$y_train))
+  )
+  for (k in seq_len(5L)) {
+    rows <- shared$cv_folds[[k]]
+    fold <- shared$cv_data[[k]]
+    stopifnot(
+      length(rows) == length(fold$y_valid),
+      nrow(fold$x_valid) == length(fold$y_valid),
+      nrow(fold$x_train) == length(fold$y_train),
+      identical(as.character(fold$y_valid),
+                as.character(shared$y_train[rows]))
+    )
+  }
+
   # Consistent metric definitions across all models.
   class_metrics <- function(actual, predicted) {
     actual <- factor(actual, levels = classes)
@@ -2240,6 +2260,64 @@ dt_results <- local({
 
     list(model = model, predicted = predicted)
   }
+
+  # Untuned reference: standard rpart complexity defaults, assessed on the
+  # same five folds. Internal CV is disabled because the shared folds are used.
+  baseline_config <- data.frame(cp = 0.01, maxdepth = 30L, minsplit = 20L)
+  baseline_fold_rows <- vector("list", 5L)
+  baseline_oof_predictions <- rep(NA_character_, length(shared$y_train))
+  baseline_fold_id <- integer(length(shared$y_train))
+
+  for (k in seq_len(5L)) {
+    rows <- shared$cv_folds[[k]]
+    fold <- shared$cv_data[[k]]
+    fitted <- fit_tree(
+      x_train = fold$x_train,
+      y_train = fold$y_train,
+      x_valid = fold$x_valid,
+      cp = baseline_config$cp,
+      maxdepth = baseline_config$maxdepth,
+      minsplit = baseline_config$minsplit
+    )
+    m <- metrics(fold$y_valid, fitted$predicted)
+    baseline_oof_predictions[rows] <- as.character(fitted$predicted)
+    baseline_fold_id[rows] <- k
+    baseline_fold_rows[[k]] <- data.frame(
+      Fold = k,
+      cp = baseline_config$cp,
+      maxdepth = baseline_config$maxdepth,
+      minsplit = baseline_config$minsplit,
+      Macro_F1 = unname(m["Macro_F1"]),
+      Balanced_Accuracy = unname(m["Balanced_Accuracy"]),
+      Accuracy = unname(m["Accuracy"]),
+      Weighted_F1 = unname(m["Weighted_F1"])
+    )
+  }
+
+  stopifnot(!anyNA(baseline_oof_predictions), all(baseline_fold_id %in% 1:5))
+  baseline_fold_scores <- do.call(rbind, baseline_fold_rows)
+  baseline_cv_summary <- data.frame(
+    Model = "Decision tree (baseline)",
+    Mean_CV_Macro_F1 = mean(baseline_fold_scores$Macro_F1),
+    SD_CV_Macro_F1 = sd(baseline_fold_scores$Macro_F1),
+    Mean_CV_Balanced_Accuracy = mean(baseline_fold_scores$Balanced_Accuracy),
+    Mean_CV_Accuracy = mean(baseline_fold_scores$Accuracy),
+    Mean_CV_Weighted_F1 = mean(baseline_fold_scores$Weighted_F1),
+    cp = baseline_config$cp,
+    maxdepth = baseline_config$maxdepth,
+    minsplit = baseline_config$minsplit
+  )
+  keep_result(baseline_fold_scores, "decision_tree_baseline_fold_scores.csv")
+  keep_result(baseline_cv_summary, "decision_tree_baseline_metrics.csv")
+  keep_result(
+    data.frame(
+      Training_Row = seq_along(shared$y_train),
+      Actual = as.character(shared$y_train),
+      Predicted = baseline_oof_predictions,
+      Fold = baseline_fold_id
+    ),
+    "decision_tree_baseline_oof_predictions.csv"
+  )
 
   # A small, explicit complexity grid.
   # Larger cp values penalise additional splits; maxdepth limits tree depth.
@@ -2687,6 +2765,17 @@ validation_summary <- local({
           max(result[[paste0(prefix, "_grid_summary")]]$Mean_CV_Macro_F1),
           paste(name, "selected grid maximum"))
   }
+  baseline_oof <- dt_results$decision_tree_baseline_oof_predictions
+  baseline_oof <- baseline_oof[order(baseline_oof$Training_Row), ]
+  record("Decision tree baseline OOF alignment",
+         identical(as.integer(baseline_oof$Training_Row), seq_along(shared$y_train)) &&
+           identical(as.character(baseline_oof$Actual), as.character(shared$y_train)) &&
+           identical(as.integer(baseline_oof$Fold), fold_id))
+  baseline_folds <- fold_metrics(baseline_oof)
+  check_folds(baseline_folds, dt_results$decision_tree_baseline_fold_scores,
+              "Decision tree baseline CV")
+  check_summary(baseline_folds, dt_results$decision_tree_baseline_metrics,
+                "Decision tree baseline summary")
   dt_grid <- dt_results$decision_tree_grid_summary
   dt_best <- dt_grid[order(-dt_grid$Mean_CV_Macro_F1, -dt_grid$Mean_CV_Balanced_Accuracy,
                            dt_grid$maxdepth, -dt_grid$cp, dt_grid$minsplit), ][1, ]
@@ -2766,6 +2855,8 @@ xgb_holdout <- xgb_results$xgb_holdout_metrics
 xgb_test_pc <- xgb_results$xgb_holdout_per_class
 xgb_importance <- xgb_results$xgb_feature_importance
 dt_cv <- dt_results$decision_tree_selected_metrics
+dt_base <- dt_results$decision_tree_baseline_metrics
+dt_oof_pc <- dt_results$decision_tree_oof_per_class
 dt_holdout <- dt_results$decision_tree_holdout_metrics
 dt_test_pc <- dt_results$decision_tree_holdout_per_class
 dt_importance <- dt_results$decision_tree_feature_importance
@@ -3069,7 +3160,7 @@ XGBoost is fitted with `xgboost::xgb.train`, using the five-class `multi:softpro
 
 ### Decision tree
 
-A single classification tree is fitted with `rpart`, using the same eight predictors, training-only preprocessing and five folds. Splits use the default Gini criterion and no class weights. The complexity grid in Section 6 limits the tree's depth, minimum split size and complexity parameter. Internal `rpart` cross-validation is disabled (`xval = 0`) because the shared outer folds provide the selection scores.
+A single classification tree is fitted with `rpart`, using the same eight predictors, training-only preprocessing and five folds. Splits use the default Gini criterion and no class weights. The untuned reference uses the standard complexity settings (`cp = 0.01`, `maxdepth = 30`, `minsplit = 20`) and is evaluated on the same five folds. The complexity grid in Section 6 limits the tree's depth, minimum split size and complexity parameter. Internal `rpart` cross-validation is disabled (`xval = 0`) because the shared outer folds provide the selection scores.
 
 ```{r decision-tree-fitting-source, eval=FALSE, fold_label="Show complete decision-tree fitting and tuning code", code=knitr::knit_code$get("compute-decision-tree")}
 ```
@@ -3161,6 +3252,26 @@ The selected configuration (`max_depth` = `r xgb_selected$max_depth`, `eta` = `r
 
 We compare 24 configurations: `cp` in {0.001, 0.005, 0.01, 0.02}, `maxdepth` in {3, 5, 8}, and `minsplit` in {20, 50}. Selection maximises mean CV macro-F1; ties are resolved by balanced accuracy, shallower depth, larger `cp`, then smaller `minsplit`. The selected configuration uses **cp = `r dt_cv$cp`**, **maxdepth = `r dt_cv$maxdepth`** and **minsplit = `r dt_cv$minsplit`**. It achieves mean CV macro-F1 **`r fmt(dt_cv$Mean_CV_Macro_F1)`** (SD `r fmt(dt_cv$SD_CV_Macro_F1)`) and accuracy `r fmt(dt_cv$Mean_CV_Accuracy)`. The full grid and selected model are calculated in the decision-tree code panel in Section 5.
 
+The untuned reference is evaluated separately from the 24-candidate grid. Table 4a compares its standard complexity settings with the selected configuration using the same fold assignments and training-only preprocessing.
+
+```{r decision-tree-improvement-results, fold_label="Show decision tree baseline and tuning results"}
+dt_rows <- rbind(dt_base, dt_cv)
+dt_display <- data.frame(
+  Configuration = c("Untuned baseline", "Selected by CV"),
+  cp = dt_rows$cp,
+  maxdepth = dt_rows$maxdepth,
+  minsplit = dt_rows$minsplit,
+  `CV macro-F1` = dt_rows$Mean_CV_Macro_F1,
+  `Balanced accuracy` = dt_rows$Mean_CV_Balanced_Accuracy,
+  Accuracy = dt_rows$Mean_CV_Accuracy,
+  check.names = FALSE
+)
+knitr::kable(dt_display, digits = 3, row.names = FALSE,
+  caption = "Table 4a. Decision tree: baseline and selected configuration on the shared five folds.")
+```
+
+Tuning changes mean macro-F1 from `r fmt(dt_base$Mean_CV_Macro_F1)` to `r fmt(dt_cv$Mean_CV_Macro_F1)` (`r sprintf("%+.3f", dt_cv$Mean_CV_Macro_F1 - dt_base$Mean_CV_Macro_F1)`), balanced accuracy from `r fmt(dt_base$Mean_CV_Balanced_Accuracy)` to `r fmt(dt_cv$Mean_CV_Balanced_Accuracy)`, and accuracy from `r fmt(dt_base$Mean_CV_Accuracy)` to `r fmt(dt_cv$Mean_CV_Accuracy)`. These are model-selection results on reused folds; they do not establish performance on future admissions.
+
 ## 7. Model Evaluation & Selection
 
 ### Evaluation metrics
@@ -3187,6 +3298,14 @@ ggplot(recall_long, aes(Class, Recall, fill = Model)) +
        caption = "Figure 5. Pooled out-of-fold recall for all five models; each animal is predicted outside its training fold.") +
   theme(legend.position = "bottom")
 ```
+
+```{r decision-tree-class-results, fold_label="Show decision tree class-level evaluation"}
+knitr::kable(dt_oof_pc, digits = 3, row.names = FALSE,
+  col.names = c("Outcome", "Animals", "Precision", "Recall", "F1"),
+  caption = "Table 5a. Selected decision tree: pooled out-of-fold performance by outcome.")
+```
+
+Table 5a expands the decision-tree recall bars in Figure 5 to include precision, F1 and the number of animals in each outcome group. These pooled class scores use one validation prediction per training animal; the overall comparison in Table 5 uses the mean of the five fold scores.
 
 **`r selected_model_name` has the highest mean CV macro-F1 among the five completed models.** XGBoost's mean macro-F1 of `r fmt(xgb_selected$Mean_CV_Macro_F1)` differs from random forest by `r sprintf("%+.3f", xgb_selected$Mean_CV_Macro_F1 - rf_selected$Mean_Macro_F1)`; this small difference is not evidence of a decisive advantage. The practical distinction is its greater recall for Euthanasia and Other. Random forest and SVM achieve about 0.80 accuracy but identify few Euthanasia cases. The selected logistic model has lower macro-F1, although its stronger Return and Other recall makes it informative when missed cases are a priority. The single decision tree has mean macro-F1 `r fmt(dt_cv$Mean_CV_Macro_F1)`; its high accuracy coexists with weak recall for rare outcomes.
 
@@ -3249,7 +3368,7 @@ Recorded animal characteristics provide useful but incomplete information about 
 
 The largest practical concern is prediction-time availability. In the logistic sensitivity analysis, excluding spay/neuter status reduces mean CV macro-F1 from `r fmt(lr_selected$macro_F1)` to `r fmt(lr_sensitivity$macro_F1[grepl("^CV without Spayed.Neutered$", lr_sensitivity$Check)])`; excluding both that field and name reduces it to `r fmt(lr_sensitivity$macro_F1[grepl("^CV without Spayed.Neutered \\+ has_Name$", lr_sensitivity$Check)])`. This dependence does not prove leakage, but it makes verification of intake-time values essential. The same sensitivity checks have not been established for XGBoost.
 
-Other limitations are the heterogeneous Other class, EDA conducted before the split, tuning and ranking on the same folds, and a target population restricted to the latest recorded admission per animal. A random split from one shelter does not establish performance in later periods or other shelters. Future work should verify field timestamps, evaluate a later admission cohort, and assess calibration and stakeholder-defined error costs before operational use.
+The Other category combines different outcomes, which makes it harder to interpret. The analysis covers each animal’s latest recorded admission at Austin Animal Center. The random test split assesses performance within this dataset; performance on future admissions remains untested. Before operational use at this shelter, future work should verify that predictors are available at admission and evaluate the model on a later cohort. Evaluation at other shelters would be needed only if broader use is intended.
 
 ## References
 
