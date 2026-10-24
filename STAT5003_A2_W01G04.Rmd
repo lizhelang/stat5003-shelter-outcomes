@@ -61,7 +61,7 @@ caption { color:#364f65; text-align:left; font-size:12px; }
 .eda-figure-block p.caption { color:#364f65; font-size:12px; line-height:1.35; margin-top:5px; }
 details.r-source { margin:8px 0; border:1px solid #dbe3ea; border-radius:4px; }
 details.r-source summary { cursor:pointer; padding:7px 10px; color:#34546e; font-size:12px; background:#f7f9fb; }
-details.r-source pre { margin:0; border:0; border-top:1px solid #dbe3ea; border-radius:0; max-height:520px; overflow:auto; }
+details.r-source pre { margin:0; border:0; border-top:1px solid #dbe3ea; border-radius:0; max-height:520px; overflow:auto; }j
 .btn-group.pull-right { display:none; }
 .scope-note { padding:9px 12px; background:#f4f6f8; border-left:3px solid #7f95a9; font-size:12px; }
 @media print {
@@ -1178,7 +1178,11 @@ lr_results <- local({
   }
   pred_multinom <- function(fit, X) as.character(predict(fit, newdata = data.frame(X), type = "class"))
 
-  cv_rows <- list(); fold_rows <- list(); grid_rows <- list(); oof <- list()
+  fold_rows <- list()
+  multinom_predictions <- list(
+    "M0 multinom" = vector("list", length(cv_data)),
+    "M1 multinom + weights" = vector("list", length(cv_data))
+  )
 
   # Majority-class reference and plain multinomial models
   for (k in seq_along(cv_data)) {
@@ -1192,7 +1196,9 @@ lr_results <- local({
     for (mod in c("M0 multinom", "M1 multinom + weights")) {
       w <- if (mod == "M0 multinom") NULL else class_weights(d$y_train)
       fit <- fit_multinom(des$Xtr, d$y_train, w)
-      m <- class_metrics(yva, pred_multinom(fit, des$Xnew))
+      pred <- pred_multinom(fit, des$Xnew)
+      multinom_predictions[[mod]][[k]] <- pred
+      m <- class_metrics(yva, pred)
       fold_rows[[length(fold_rows) + 1]] <- tibble(Model = mod, Fold = k, !!!as.list(m$summary),
                                                    !!!setNames(as.list(m$recall), paste0("recall_", classes)))
     }
@@ -1202,16 +1208,19 @@ lr_results <- local({
   tune_glmnet <- function(spec) {
     full <- build_design(x_train, x_train, miss_train, miss_train, spec)
     res <- list()
+    predictions <- list()
     for (a in alphas) {
       path <- glmnet(full$Xtr, y_train, family = "multinomial", type.multinomial = "grouped",
                      alpha = a, weights = class_weights(y_train), nlambda = n_lambda,
                      lambda.min.ratio = 1e-4)$lambda
+      fold_predictions <- vector("list", length(cv_data))
       for (k in seq_along(cv_data)) {
         d <- cv_data[[k]]
         des <- build_design(d$x_train, d$x_valid, fold_miss[[k]]$tr, fold_miss[[k]]$va, spec)
         fit <- glmnet(des$Xtr, d$y_train, family = "multinomial", type.multinomial = "grouped",
                       alpha = a, weights = class_weights(d$y_train), lambda = path)
         pr <- predict(fit, des$Xnew, type = "class")
+        fold_predictions[[k]] <- pr
         for (j in seq_along(path)) {
           m <- class_metrics(d$y_valid, pr[, j])
           res[[length(res) + 1]] <- tibble(spec = spec, alpha = a, lambda = path[j], Fold = k,
@@ -1219,10 +1228,12 @@ lr_results <- local({
                                            !!!setNames(as.list(m$recall), paste0("recall_", classes)))
         }
       }
+      predictions[[as.character(a)]] <- list(lambda = path, folds = fold_predictions)
     }
-    bind_rows(res)
+    list(scores = bind_rows(res), predictions = predictions)
   }
-  grid <- bind_rows(tune_glmnet("base"), tune_glmnet("extended"))
+  tuned <- list(base = tune_glmnet("base"), extended = tune_glmnet("extended"))
+  grid <- bind_rows(tuned$base$scores, tuned$extended$scores)
 
   grid_summary <- grid %>% group_by(spec, alpha, lambda) %>%
     summarise(mean_macro_F1 = mean(macro_F1), se_macro_F1 = sd(macro_F1) / sqrt(n()),
@@ -1314,12 +1325,22 @@ lr_results <- local({
     theme_minimal(base_size = 10) + theme(panel.grid = element_blank())
 
   # ---- oof-predictions ----
-  # Out-of-fold predictions of the chosen model (useful for the group comparison).
+  # Reuse the exact class predictions scored during CV. Refitting a single
+  # lambda can differ from its path fit, and another class call can break ties differently.
+  selected_predictions <- if (final_is_glmnet) {
+    candidate <- tuned[[final_spec]]$predictions[[as.character(final_alpha)]]
+    lambda_index <- match(final_lambda, candidate$lambda)
+    stopifnot(length(lambda_index) == 1L, !is.na(lambda_index))
+    lapply(candidate$folds, function(pr) as.character(pr[, lambda_index]))
+  } else {
+    multinom_predictions[[final_name]]
+  }
   oof_df <- bind_rows(lapply(seq_along(cv_data), function(k) {
     d <- cv_data[[k]]
-    r <- fit_final(d$x_train, d$y_train, d$x_valid, fold_miss[[k]]$tr, fold_miss[[k]]$va)
+    pred <- selected_predictions[[k]]
+    stopifnot(length(pred) == length(d$y_valid), !anyNA(pred))
     data.frame(train_row = cv_folds[[k]], Animal.ID = train_raw$Animal.ID[cv_folds[[k]]],
-               Fold = k, truth = d$y_valid, pred = r$pred, round(r$prob, 5), check.names = FALSE)
+               Fold = k, truth = d$y_valid, pred = pred, check.names = FALSE)
   })) %>% arrange(train_row)
 
   # ---- odds-ratios ----
@@ -2556,8 +2577,7 @@ validation_summary <- local({
   tolerance <- 1e-8
   checks <- list()
   record <- function(label, condition) {
-    if (!isTRUE(condition)) message("Validation failed: ", label)
-    stopifnot(isTRUE(condition))
+    if (!isTRUE(condition)) stop("Validation failed: ", label, call. = FALSE)
     checks[[length(checks) + 1L]] <<- data.frame(Check = label, Passed = TRUE)
     invisible(TRUE)
   }
